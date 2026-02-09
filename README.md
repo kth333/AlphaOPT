@@ -111,18 +111,3 @@ Configure training and evaluation parameters in `train_params.yaml` and `eval_pa
 - **Learned Library** (`data/experience_library/library.json`): Experience library after library learning and library refinement in the training phase, which is used for insight retrieval on evaluation data
 - **Library Taxonomy** (`data/experience_library/latest_taxonomy.json`): Latest library insight taxonomy for retrieval
 
-
-## 🖊️ Citation
-
-If our work contributes to your research, we would greatly appreciate it if you could star this repository ⭐ and cite our paper:
-
-```bibtex
-@article{kong2025alphaopt,
-  title={AlphaOPT: Formulating Optimization Programs with Self-Improving LLM Experience Library},
-  author={Kong, Minwei and Qu, Ao and Guo, Xiaotong and Ouyang, Wenbin and Jiang, Chonghe and Zheng, Han and Ma, Yining and Zhuang, Dingyi and Tang, Yuhan and Li, Junyi and Wang, Hai and Wu, Cathy and Zhao, Jinhua},
-  journal={arXiv preprint arXiv:2510.18428},
-  year={2025},
-  url={https://arxiv.org/abs/2510.18428}
-}
-}
-```
