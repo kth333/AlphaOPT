@@ -282,6 +282,62 @@ Now take a deep breath and think step by step. You will be awarded a million dol
 """
 
 
+PROMPT_PROGRAM_INS_POS_NEG="""
+You are an expert in Industrial Engineering and Operations Research and mathematical programming implementation.
+
+You are given:
+1) A problem description for the optimization task
+2) The mathematical model (LaTeX) used to generate the solver code
+3) The failed solver program that could not run successfully
+4) The execution feedback / error message
+5) A collection of retrieved "Code Implementation" insights your colleague consulted, each insight includes:
+    - insight_id: the unique ID for this insight
+    - condition: the problem-specific context and broader modeling situations in which the insight should apply to avoid mistakes (i.e., its applicability condition)
+    - explanation: the description of the pitfalls and guidance for the proper principle/practice
+
+### Problem description
+{problem_description}
+
+### Mathematical model (LaTeX)
+{mathematical_model}
+
+### Failed solver program (Python)
+```python
+{failed_program}
+```
+
+### Execution feedback
+{feedback}
+
+### Retrieved code implementation insights
+{retrieved_insights}
+
+### Your task
+For EACH insight in the retrieved collection, decide whether it is misleading for this task and likely contributed to the run-time failure.
+
+Assign:
+- "positive": the insight is correct/applicable (even if it may not fully fix the bug).
+- "negative": the insight is wrong/inapplicable/misleading for this task, and could plausibly lead to the observed run-time failure if followed.
+
+### STRICT OUTPUT FORMAT
+Return ONLY a JSON array. Each element must contain:
+- "insight_id" (integer)
+- "state" (string: "positive" or "negative")
+
+Example:
+```json
+[
+  {{"insight_id": 12, "state": "positive"}},
+  {{"insight_id": 34, "state": "negative"}}
+]
+```
+
+Guidelines:
+- Do NOT miss any insight_id from the given collection.
+- Output ONLY the JSON array. No extra text.
+"""
+
+
 
 
 PROMPT_VALIDATE_ISSUES="""

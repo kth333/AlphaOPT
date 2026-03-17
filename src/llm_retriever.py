@@ -10,6 +10,12 @@ from .dataloader import DataLoader, Task
 from .prompts.prompts_diag import PROMPT_RETRI_LABEL, PROMPT_RETRI_INS
 from .prompts.prompts_retri import PROMPT_QUICK_MATCH_MODEL, PROMPT_FULL_CHECK_MODEL, PROMPT_QUICK_MATCH_CODE, PROMPT_FULL_CHECK_CODE
 
+# from experience_library import ExperienceLibrary, Insight
+# from utils import save_log_data, call_llm_and_parse_with_retry, extract_json_array
+# from dataloader import DataLoader, Task
+# from prompts.prompts_diag import PROMPT_RETRI_LABEL, PROMPT_RETRI_INS
+# from prompts.prompts_retri import PROMPT_QUICK_MATCH_MODEL, PROMPT_FULL_CHECK_MODEL, PROMPT_QUICK_MATCH_CODE, PROMPT_FULL_CHECK_CODE
+
 
 class LibraryRetrieval:
     """
@@ -100,7 +106,7 @@ class LibraryRetrieval:
                     prompt=batch_prompt,
                     parse_fn=extract_json_array,
                     temperature=0,
-                    max_retry=5,
+                    max_retry=3,
                     sleep_sec=0.5,
                     verbose=verbose,
                     log_header=batch_header,
@@ -156,7 +162,7 @@ class LibraryRetrieval:
                 prompt=prompt,
                 parse_fn=self.extract_taxonomy, 
                 temperature=0,
-                max_retry=5,
+                max_retry=3,
                 sleep_sec=5,
                 verbose=verbose,
                 log_header=custom_header,
@@ -174,6 +180,7 @@ class LibraryRetrieval:
             print(f"\n   [{stage}] Task {task.id}: No matched taxonomy labels found in the library\n")
             return {}
         
+        # matched_taxo = {stage: matched_taxo}
         # Retrieve the insights under the matched taxonomy labels
         matched_insights = self.library.retrieve_by_taxonomy(query_taxonomy=matched_taxo)
 
@@ -221,6 +228,18 @@ class LibraryRetrieval:
                     print(f"\n   Task {task.id} : No insights in library, skip!\n")
                 return []
 
+        # if stage == "Formulation": 
+            # prompt = PROMPT_FULL_CHECK_MODEL.format(
+            #     problem_description=task.desc, 
+            #     candidate_insights=json.dumps(matched_insights)
+            #     )
+        
+        # if stage == "Program":
+        #     prompt = PROMPT_FULL_CHECK_CODE.format(
+        #         problem_description=task.desc, 
+        #         mathematical_model=formulation,
+        #         candidate_insights=json.dumps(matched_insights)
+        #         )
         if stage == "Formulation": 
             prompt_template = PROMPT_FULL_CHECK_MODEL
             prompt_kwargs = {
@@ -236,6 +255,27 @@ class LibraryRetrieval:
 
         custom_header = f"\n==========\n[Iteration {iter}] Check the applicability of insights on [{stage}] for Task {task.id}\n==========\n"
         error_message = f"\n   Task {task.id} [{stage}]: failed to extract applicable insights after maximum attempts\n"
+        # try:
+        #     # Call the LLM and parse the output (==== ... ==== JSON block)
+        #     applicable_results = call_llm_and_parse_with_retry(
+        #         model=self.model,
+        #         service=self.service,
+        #         prompt=prompt,
+        #         # Output a list with insights or an empty list []
+        #         parse_fn=extract_json_array,
+        #         temperature=0,
+        #         max_retry=3,
+        #         sleep_sec=0.5,
+        #         verbose=verbose,
+        #         log_header=custom_header,
+        #         error_message=error_message
+        #     )
+
+        # Handle malformed LLM outputs to ensure continued execution
+        # except Exception as e:
+        #     print(f"\n   [WARNING] Task {task.id} [{stage}]: Failed to parse LLM output after max retries; using candidate insights as fallback.\n")
+        #     traceback.print_exc()
+        #     applicable_results = matched_insights
 
         # Use batch processing function
         applicable_results = self._process_insights_in_batches(
@@ -310,7 +350,7 @@ class LibraryRetrieval:
                     # Output a dict with taxonomy labels or an empty dict {}
                     parse_fn=self.extract_taxonomy, 
                     temperature=0,
-                    max_retry=5,
+                    max_retry=3,
                     sleep_sec=5,
                     verbose=verbose,
                     log_header=custom_header,
@@ -331,6 +371,14 @@ class LibraryRetrieval:
             # Retrieve the insights under the matched taxonomy labels, exclude already existing insights
             matched_insights = self.library.retrieve_by_taxonomy(query_taxonomy=issue_matched_taxo, filter_fn=filter_fn)
 
+            #* Check applicability
+            # prompt = PROMPT_RETRI_INS.format(
+            #     problem_description=task.desc, 
+            #     failed_formulation=formulation,
+            #     one_diagnosed_issue=json.dumps(issue),
+            #     candidate_insights=json.dumps(matched_insights)
+            # )
+
             # Prepare prompt template and parameters
             prompt_template = PROMPT_RETRI_INS
             prompt_kwargs = {
@@ -341,6 +389,27 @@ class LibraryRetrieval:
             
             custom_header = f"\n==========\n[Iteration {iter}] [Unretrieved Insight] Check applicability for Task {task.id}\n==========\n"
             error_message = f"\n   Task {task.id} [Diagnosis]: Failed to extract applicable insights after maximum attempts\n"
+
+            # try:
+            #     applicable_results = call_llm_and_parse_with_retry(
+            #         model=self.model,
+            #         service=self.service,
+            #         prompt=prompt,
+            #         # Output a list with insights or an empty list []
+            #         parse_fn=extract_json_array,
+            #         temperature=0,
+            #         max_retry=3,
+            #         sleep_sec=0.5,
+            #         verbose=verbose,
+            #         # log_header=custom_header,
+            #         error_message=error_message
+            #     )
+                
+            # # Handle malformed LLM outputs to ensure continued execution
+            # except Exception as e:
+            #     print(f"\n   [WARNING] Task {task.id} [Diagnosis]: Failed to parse LLM output after max retries; using candidate insights as fallback.\n")
+            #     traceback.print_exc()
+            #     applicable_results = matched_insights
 
             # Use batch processing function
             applicable_results = self._process_insights_in_batches(

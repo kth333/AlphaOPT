@@ -1,0 +1,57 @@
+base_model: google/gemini-2.5-flash  
+advanced_model: google/gemini-2.5-flash
+base_service: openrouter # null for direct API calls
+advanced_service: openrouter
+verbose: false
+start_iter: 0
+data_slice: 
+
+# API Keys
+api_keys:
+  OPEN_ROUTER_KEY: 
+  GEMINI_API_KEY: 
+  OPENAI_API_KEY:    # Set your OpenAI API key here 
+
+params:
+  num_iterations: 1
+  batch_size: 12
+  tolerance: 0.1
+  max_solution_attempts: 1
+  max_verify_attempts: 3
+  variant_num: 5  # the number of refined condition 
+  
+dataset: train_data_4o_new_300 
+output_folder: train_data_300_flash_latest 
+file_paths:
+  train_data_path: ./data/optimization_tasks/train/${dataset}.json
+  train_output_dir: ./learning/${output_folder}/
+  lib_dir: ./data/experience_library/iterations/${output_folder}/
+  metrics_log_path: ./learning/${output_folder}/iteration_metrics.json
+
+ablation:
+  taxonomy: true                 # Whether to enable taxonomy-based retrieval
+  rewrite: false                 # Whether to enable insight rewriting
+  include_example: true          # Whether to include insight examples
+  include_program_insight: true  # Whether to include code implementation insight
+  max_debug_retry: 3             # Whether to enable self-debug and number of times
+
+# Token pricing (USD per 1M tokens)
+pricing:
+  gemini:
+    gemini-2.5-pro:
+      prompt_per_million: 1.25
+      completion_per_million: 10.0
+    gemini-2.5-flash:
+      prompt_per_million: 0.30
+      completion_per_million: 2.50
+
+  openai:
+    gpt-4o:
+      prompt_per_million: 2.50
+      completion_per_million: 10.0
+    gpt-4o-mini:
+      prompt_per_million: 0.15
+      completion_per_million: 0.60
+    gpt-4.1:
+      prompt_per_million: 2.00
+      completion_per_million: 8.00

@@ -12,7 +12,13 @@ from .llm_programmer import ProgramGenerator
 from .llm_retriever import LibraryRetrieval
 from .train_eval_utils import check_optimality, is_optimal_with_tolerance
 
-from .prompts.prompts_diag import PROMPT_DIAGNOSE_ISSUES, PROMPT_INS_POS_NEG, PROMPT_VALIDATE_ISSUES, PROMPT_PROGRAM_DIAG
+from .prompts.prompts_diag import (
+    PROMPT_DIAGNOSE_ISSUES,
+    PROMPT_INS_POS_NEG,
+    PROMPT_VALIDATE_ISSUES,
+    PROMPT_PROGRAM_DIAG,
+    PROMPT_PROGRAM_INS_POS_NEG,
+)
 
 
 #* Configure
@@ -189,7 +195,16 @@ class ProgramDiagnostic:
         except Exception as err:
             print(f"\n   [WARNING] Task {task.id}: Handle malformed LLM outputs after maximum retry as failing to diagnose insights\n")
             traceback.print_exc() # print error and cause
-            return []
+            # Return default values matching the expected return signature:
+            # (insights_diag, pos_formulation_ins, is_retrieve_new, new_formulation, updated_issues)
+            formulation_ins, program_ins = retrieved_insights
+            return {}, formulation_ins, True, failed_formulation, diagnosed_issues
+
+        # Validate insights_diag is a list
+        if not isinstance(insights_diag, list) or not insights_diag:
+            print(f"\n   [WARNING] Task {task.id}: Invalid insights_diag format, using default values\n")
+            formulation_ins, program_ins = retrieved_insights
+            return {}, formulation_ins, True, failed_formulation, diagnosed_issues
 
         if save_data:
             # Save and run corrected code
@@ -260,6 +275,288 @@ class ProgramDiagnostic:
 
         return insights_diag, pos_formulation_ins, is_retrieve_new, new_formulation, updated_issues
 
+    def diagnose_program(
+        self,
+        *,
+        iter: int = None,
+        task: "Task" = None,
+        formulation: str = None,
+        failed_program: str = None,
+        feedback: str = None,
+        retrieved_formulation_insights: Optional[List[dict]] = None,
+        retrieved_program_insights: List[dict] = None,
+        llm_opt: Optional["ProgramGenerator"] = None,
+        llm_retri: Optional["LibraryRetrieval"] = None,
+        max_unretrieved_trials: int = 4,
+        verbose: bool = False,
+        save_data: bool = False,
+        output_path: str = "learning",
+    ) -> tuple[dict, list[dict], Optional[str], object, bool, bool, bool, str, Optional[str]]:
+        """
+        Diagnose and fix run_error by:
+          1) labeling retrieved program-stage insights as positive/negative and filtering "negative"
+          2) regenerating a program with filtered insights
+          3) if still run_error, retrieving extra candidate program insights and trying a few ("unretrieved")
+             - insights that resolve run_error are labeled as "unretrieved"
+
+        Returns:
+          - insights_diag: {insight_id: state}
+          - final_program_insights: filtered list (and possibly augmented with one "unretrieved" insight)
+          - candidate_program, output, runnable, is_time_out, is_optimal, output_status, feedback
+        """
+        if llm_opt is None:
+            raise ValueError("diagnose_program requires llm_opt (ProgramGenerator) to regenerate/check programs.")
+
+        retrieved_formulation_insights = retrieved_formulation_insights or []
+        retrieved_program_insights = retrieved_program_insights or []
+        original_program_insights = list(retrieved_program_insights)
+
+        # ===== Signals =====
+        # 1) Start program_ins diagnosis
+        try:
+            tid = task.id
+        except Exception:
+            tid = None
+        print(
+            f"[Task {tid}]: Start diagnosing program insights"
+        )
+
+        insights_diag: dict = {}
+        filtered: list[dict] = []
+        had_negative = False
+        used_unretrieved = False
+
+        if retrieved_program_insights:
+            prompt = PROMPT_PROGRAM_INS_POS_NEG.format(
+                problem_description=task.desc,
+                mathematical_model=formulation or "",
+                failed_program=failed_program or "",
+                feedback=feedback or "",
+                retrieved_insights=json.dumps(retrieved_program_insights, indent=2, ensure_ascii=False),
+            )
+
+            log_header = (
+                f"\n==========\n[Iteration {iter}] Diagnose program insights (pos/neg) for Task {task.id}\n==========\n"
+            )
+            error_message = (
+                f"\n   Task {task.id} failed to diagnose program insights after maximum attempts\n"
+            )
+
+            try:
+                diag_list = call_llm_and_parse_with_retry(
+                    model=self.model,
+                    service=self.service,
+                    prompt=prompt,
+                    parse_fn=extract_json_array,
+                    temperature=self.temp,
+                    max_retry=3,
+                    sleep_sec=2,
+                    verbose=verbose,
+                    log_header=log_header,
+                    error_message=error_message,
+                )
+            except Exception:
+                # Fallback: keep all insights as positive (no filtering)
+                diag_list = [{"insight_id": ins.get("insight_id"), "state": "positive"} for ins in retrieved_program_insights]
+
+            # Normalize and validate
+            if isinstance(diag_list, list):
+                for item in diag_list:
+                    if not isinstance(item, dict):
+                        continue
+                    iid = item.get("insight_id")
+                    state = item.get("state")
+                    if iid is None:
+                        continue
+                    if state not in ("positive", "negative"):
+                        # Default unknown states to positive to be conservative
+                        state = "positive"
+                    insights_diag[iid] = state
+
+            # Ensure every retrieved insight_id has a label
+            for ins in retrieved_program_insights:
+                iid = ins.get("insight_id")
+                if iid is None:
+                    continue
+                insights_diag.setdefault(iid, "positive")
+
+            if save_data:
+                diag_path = f"{output_path}/Diagnosis/program_ins_pos_neg_diagnosis_iter_{iter}.json"
+                save_log_data(
+                    [{"insight_id": k, "state": v} for k, v in insights_diag.items()],
+                    diag_path,
+                )
+
+            filtered = [
+                ins for ins in retrieved_program_insights
+                if insights_diag.get(ins.get("insight_id"), "positive") != "negative"
+            ]
+            had_negative = any(st == "negative" for st in insights_diag.values())
+
+        # Re-generate program with filtered (non-negative) program insights
+        candidate_program, output, runnable, is_time_out = llm_opt.generate_program(
+            iter=iter,
+            task=task,
+            retrieved_insights=filtered,
+            formulation=formulation,
+            abl_params=config.ablation,
+            verbose=False,
+            save_data=True,
+            output_path=output_path,
+        )
+        is_optimal, output_status, new_feedback = check_optimality(
+            task=task, output=output, runnable=runnable, is_time_out=is_time_out
+        )
+        # Prefer the most recent feedback if available
+        feedback = new_feedback or feedback
+
+        final_program_insights = list(filtered)
+
+        # 2) negative removed & runnable after regeneration
+        if had_negative and output_status != "run_error":
+            print(
+                f"[Task {tid}]: Found negative program insights, removed and now runnable."
+            )
+
+        # If still run_error, try to find unretrieved program insights and retry program generation.
+        if output_status == "run_error" and llm_retri is not None:
+            exclude_ids = {
+                ins.get("insight_id")
+                for ins in (retrieved_formulation_insights + original_program_insights)
+                if ins.get("insight_id") is not None
+            }
+            extra_program_ins = llm_retri.retrieve_applicable_insights(
+                iter=iter,
+                task=task,
+                stage="Program",
+                formulation=formulation,
+                config=config,
+                verbose=False,
+                save_data=True,
+                output_path=output_path,
+            )
+            extra_program_ins = [
+                ins for ins in (extra_program_ins or [])
+                if ins.get("insight_id") is not None and ins.get("insight_id") not in exclude_ids
+            ]
+
+            for cand in extra_program_ins[:max_unretrieved_trials]:
+                trial_program_ins = final_program_insights + [cand]
+                trial_program, trial_output, trial_runnable, trial_is_time_out = llm_opt.generate_program(
+                    iter=iter,
+                    task=task,
+                    retrieved_insights=trial_program_ins,
+                    formulation=formulation,
+                    abl_params=config.ablation,
+                    verbose=False,
+                    save_data=True,
+                    output_path=output_path,
+                )
+                trial_is_optimal, trial_output_status, trial_feedback = check_optimality(
+                    task=task,
+                    output=trial_output,
+                    runnable=trial_runnable,
+                    is_time_out=trial_is_time_out,
+                )
+
+                if trial_output_status != "run_error":
+                    iid = cand.get("insight_id")
+                    if iid is not None:
+                        insights_diag[iid] = "unretrieved"
+                    used_unretrieved = True
+
+                    final_program_insights = trial_program_ins
+                    candidate_program = trial_program
+                    output = trial_output
+                    runnable = trial_runnable
+                    is_time_out = trial_is_time_out
+                    is_optimal = trial_is_optimal
+                    output_status = trial_output_status
+                    feedback = trial_feedback or feedback
+                    # 3) unretrieved added & runnable
+                    print(
+                        f"[Task {tid}]: Found unretrieved program insight, added and now runnable."
+                    )
+                    break
+
+            if save_data and any(st == "unretrieved" for st in insights_diag.values()):
+                unretrieved_path = f"{output_path}/Diagnosis/program_unretrieved_iter_{iter}.json"
+                save_log_data(
+                    [{"insight_id": k, "state": v} for k, v in insights_diag.items() if v == "unretrieved"],
+                    unretrieved_path,
+                )
+
+        # 4) Still need new insights (either still run_error, or runnable but not optimal)
+        if output_status == "run_error":
+            print(f"[Task {tid}] 4 Need new insights | reason=still_run_error")
+        elif not is_optimal:
+            # runnable but not optimal -> likely proceed to formulation diagnosis / new insights
+            # (if it became runnable due to negative removal or unretrieved addition, 2/3 signals already printed)
+            print(f"[Task {tid}] 4 Need new insights | reason=not_optimal")
+
+        return (
+            insights_diag,
+            final_program_insights,
+            candidate_program,
+            output,
+            runnable,
+            is_time_out,
+            is_optimal,
+            output_status,
+            feedback,
+        )
+
+    def _get_insight_id(self, ins) -> Optional[str]:
+        """
+        Robustly extract insight_id from either a dict-like insight or an object.
+        Returns None if insight_id is missing.
+        """
+        if ins is None:
+            return None
+        if isinstance(ins, dict):
+            return ins.get("insight_id")
+        return getattr(ins, "insight_id", None)
+
+    def _dedup_inner_list_by_id(self, lst):
+        "Deduplicate a list by insight_id (keep the first occurrence)."
+        seen = set()
+        out = []
+        for ins in lst:
+            iid = self._get_insight_id(ins)
+            # If insight_id is missing, keep it (treat as unique).
+            if iid is None or iid not in seen:
+                if iid is not None:
+                    seen.add(iid)
+                out.append(ins)
+        return out
+
+    def unique_combo_gen(self, lists_of_ins):
+        """
+        Generate unique insight combinations from Cartesian product:
+        - dedup within a combo by insight_id (keep first occurrence)
+        - dedup across combos by sorted insight_id signature
+        """
+        seen_keys = set()
+        for combo in itertools.product(*lists_of_ins):
+            # Dedup within a combo by insight_id (e.g., (A,B,A) -> [A,B]), keep first occurrence.
+            uniq = []
+            seen_ids = set()
+            for ins in combo:
+                iid = self._get_insight_id(ins)
+                if iid is None:
+                    uniq.append(ins)
+                    continue
+                if iid not in seen_ids:
+                    seen_ids.add(iid)
+                    uniq.append(ins)
+
+            # Use a sorted insight_id signature to avoid cross-combo duplicates (e.g., (A,B) vs (B,A,A)).
+            key = tuple(sorted(seen_ids))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            yield uniq
+
     def _diagnose_unretrieved(
         self,
         iter: int = None,
@@ -291,14 +588,11 @@ class ProgramDiagnostic:
                 output_path=output_path,
         )
 
-        # candidate_ins_set = [
-        #     self._dedup_inner_list_by_id(insights)
-        #     for insights in issues_applicable_insights.values()
-        #     if insights  # * remove empty insight list for any issue
-        # ]
+        # Each issue may return duplicated insights; dedup per-issue first.
         candidate_ins_set = [
-            insights for insights in issues_applicable_insights.values()
-            if insights  #* remove empty insight list for any issue
+            self._dedup_inner_list_by_id(insights)
+            for insights in issues_applicable_insights.values()
+            if insights  # * remove empty insight list for any issue
         ]
 
         is_generate_new = True
@@ -309,13 +603,11 @@ class ProgramDiagnostic:
 
         # Only iterate the subset combinations
         max_combo_size = 8
-        
-        for idx, unretrieved_ins in enumerate(itertools.islice(itertools.product(*candidate_ins_set), max_combo_size)):
-            unretrieved_ins = list(unretrieved_ins)
+        # Use islice to cap the number of UNIQUE combinations (dedup within combo and across combos by insight_id).
+        for idx, unretrieved_ins in enumerate(
+            itertools.islice(self.unique_combo_gen(candidate_ins_set), max_combo_size)
+        ):
             combo_unretrieved_ins.append(unretrieved_ins)
-        
-        # for idx, unretrieved_ins in enumerate(
-        #     itertools.islice(self.unique_combo_gen(candidate_ins_set), max_combo_size)):
 
             formulation_ins = pos_formulation_ins + unretrieved_ins
             # Generate new formulation
@@ -463,7 +755,7 @@ class ProgramDiagnostic:
             diagnosed_issues=diagnosed_issues,
             retrieved_insights=retrieved_insights,
             llm_opt=llm_opt,
-            verbose=True,
+            verbose=False,
             save_data=save_data,
             output_path=output_path
         )
@@ -499,7 +791,7 @@ class ProgramDiagnostic:
             return insights_diag, updated_formulation_ins, is_generate_new, new_formulation
 
 
-    def diagnose_program(
+    def debug_program(
         self,
         iter: int = None,
         task: "Task" = None,
@@ -512,7 +804,7 @@ class ProgramDiagnostic:
         """
         Diagnose and correct the failed program with LLM
         """
-        max_retry_correct = 12  
+        max_retry_correct = 8
         runnable = False                    
         current_program  = failed_program
         current_feedback = feedback
@@ -538,7 +830,7 @@ class ProgramDiagnostic:
                     # Extract code script from LLM response
                     parse_fn    = self.extract_code,
                     temperature = self.temp,
-                    max_retry   = 3,                  
+                    max_retry   = 5,                  
                     sleep_sec   = 2,
                     verbose     = verbose,
                     log_header  = log_header,
@@ -559,7 +851,7 @@ class ProgramDiagnostic:
 
             #* Execute the corrected program
             try:
-                output = self.execute_code(program_path)
+                output = self.execute_code(program_path) 
                 runnable = True
                 is_time_out = False
                 #* Add solver time limitation to avoid large time cost on solving single task

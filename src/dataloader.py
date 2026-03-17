@@ -57,13 +57,26 @@ class DataLoader:
         mode: str = "learn",
         task_list: list = None,
         filter_success_num: int = None,
-        reset: bool = False
+        reset: bool = False,
+        string_input: str = None
     ):
         self.tasks = []
 
         if task_list is not None:
             # Construct from existing Task list
             self.tasks = task_list
+        elif string_input is not None:
+            # Create a single task from string input
+            task = Task(
+                task_id=None,
+                desc=string_input,
+                ground_truth=None,
+                formulation=None,
+                correct_program=None,
+                tag=None,
+                cluster=None
+            )
+            self.tasks = [task]
         elif data_path:
             # Auto-detect by file extension
             if data_path.endswith('.csv'):

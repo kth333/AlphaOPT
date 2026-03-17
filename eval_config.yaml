@@ -1,0 +1,26 @@
+datasets: [nlp4lp, nl4opt, industryor, mamo_complex]  # [logior, optibench] [nlp4lp, nl4opt, industryor, mamo_complex]
+data_path_template:  ./data/optimization_tasks/split/${dataset}_test.json 
+library_path:  ./data/experience_library/iterations/train_data_all_explore_4o/library_refine_iter4.json
+output_folder_template: ${dataset}_raw_4o
+model: openai/gpt-4o 
+service: openrouter # null
+n_runs: 3
+temperature: 0.0
+pass_at_k: 1
+
+ablation:
+  taxonomy: true              # Whether to enable taxonomy-based retrieval
+  rewrite: false # true              # Whether to enable insight rewriting
+  include_example: true       # Whether to include insight examples
+  include_program_insight: true  # Whether to include code implementation insight
+  max_debug_retry: 5          # Whether to enable self-debug and number of times
+
+  # Ablation
+  # When enabled, runs evaluation by setting each of the following params to false one at a time,
+  # based on the current configuration:
+  # - taxonomy: false
+  # - include_example: false
+  # - include_program_insight: false
+  sweep_one_by_one: false
+  sweep_params: [include_example]  # include_example, include_program_insight
+  include_base: false  # Whether to also run with the current configuration unchanged

@@ -9,7 +9,7 @@ from threading import Lock
 from itertools import combinations
 
 from src.dataloader import DataLoader 
-from src.utils import cal_time_cost
+from src.utils import cal_time_cost, get_token_usage
 from src.train_eval_utils import *
 
 
@@ -65,20 +65,24 @@ def run_library_online_learning(
     """
 
     lock = Lock()               # Lock to safely update shared variables
-    
-    # Global counters for online merge rate calculation
-    total_online_merge_attempts = 0
-    total_online_merge_successes = 0
-    def _train_worker(task, taxo_snapshot, train_output_path):
+
+    # Total number of merged-insight proposals from offline batch merge (before self-verify filtering)
+    total_num_all_merged = 0
+    # Total number of merged-insight groups accepted by self-verify (across batches)
+    total_num_self_verified_merged = 0
+    def _train_worker(task, taxo_snapshot, train_output_path, temp_library, lock):
         """
         Parallelize pipeline on the minibatch of tasks (insight retrieval -> formulation generation -> insight retrieval -> program generation -> check optimality -> insight extraction -> insight verification) for training tasks
-        Return: (new insights, is_success, is_execution, is_verify)
+        Return: (new insights, all_attempts_optimal, is_execution, is_verify)
         """
+        nonlocal iter_self_verify_total, iter_self_verify_success_tasks, iter_self_verify_full_retrieval_tasks, iter_self_verify_partial_retrieval_tasks
+        
         success_counts = 0
         prev_insights = []
         status_lst = []
         task_failure_record = [] #  [failed_status, feedback, formulation, program]
-        is_success, is_execution, is_verify, is_self_explore = False, True, True, None
+        all_attempts_optimal, is_execution, is_verify, is_self_explore = False, True, True, None
+        first_attempt_optimal = False  # Track if first attempt (k==1) was optimal
 
         #* Try generating program/solution up to 5 times
         for k in range(1, params.max_solution_attempts + 1):
@@ -103,6 +107,8 @@ def run_library_online_learning(
             # Extreme case: code extraction failed
             if not candidate_program:
                 status_lst.append("parse_error")
+                if k == 1:
+                    first_attempt_optimal = False  # parse_error is not optimal
                 continue
 
             # Check optimality
@@ -110,24 +116,32 @@ def run_library_online_learning(
 
             status_lst.append(output_status)
 
+            # Record first attempt optimal status for train_accuracy calculation
+            if k == 1:
+                first_attempt_optimal = is_optimal
+
+            # Update occurrence and correctness statistics for retrieved insights (only on first retrieval)
+            if k == 1 and retrieved_ins_ids:
+                library.update_retrieval_stats(retrieved_ins_ids, iter, success=is_optimal)
+
             if is_optimal:
                 success_counts += 1
                 if success_counts == params.max_solution_attempts:
                     task.success_count += 1
-                    is_success, is_execution, is_verify = True, None, None
+                    all_attempts_optimal, is_execution, is_verify = True, None, None
 
             else:
                 print(feedback)
                 task_failure_record.append([output_status, feedback, candidate_formulation, candidate_program])
         
-        #* Record the list of output statuses of 5 times
+        #* Record the list of output statuses of n times
         task.output_status.append(status_lst)
         task.retri_ins_lst.append(retrieved_ins_ids)
         task.confidence = success_counts / params.max_solution_attempts
         print(f"\n   [Task {task.id}]: Succeeded in {success_counts} of {params.max_solution_attempts} tries.")
 
 
-        # ============= Generate insights for program and formulation ============== #
+        # Generate insights for program and formulation 
         #* Generate insights from failed attempts separately
         task_new_insights = []
         fail_to_execute, fail_to_verify_program_ins, fail_to_verify_formu_ins = 0, 0, 0
@@ -139,7 +153,7 @@ def run_library_online_learning(
             #* First fix program that can not execute and generate program-related insights
             corrected_program, new_feedback, new_program_ins = None, None, []
             if output_status == "run_error":
-                is_optimal, runnable, corrected_program, new_feedback = llm_diag.diagnose_program(
+                is_optimal, runnable, corrected_program, new_feedback = llm_diag.debug_program(
                     iter=iter,
                     task=task, 
                     failed_program=candidate_program,
@@ -158,38 +172,142 @@ def run_library_online_learning(
                     continue
 
                 print(f"\n   [Task {task.id}]: Succeeded to fix a program that failed to execution!")
+        
+                # Track best partial retrieval across attempts
+                last_new_program_ins = None
+                last_retrieval_result = None
+                best_verified_insights = []
 
-                for attempt in range(1, params.max_verify_attempts + 1):
-                    # Generate insights from code implementation
-                    # print(f"\n   [Task {task.id}]: Regenerate new insights for verification at attempt {attempt}!")
-                    new_program_ins = llm_ins.generate_insights(
-                        iter=iter,
-                        task=task,
-                        corrected_program=corrected_program, 
-                        taxonomy=taxo_snapshot,
-                        verbose=False,
-                        save_data=True,
-                        output_path=train_output_path
-                    )
+                for attempt_num in range(1, params.max_verify_attempts + 1):
+                    # Decide whether to regenerate or to modify missed insights
+                    modified_insight_ids = set()  # Track which insights were modified in this attempt
+                    if last_retrieval_result is not None:
+                        # Task was successful but retrieval was partial/none:
+                        # skip regenerate and modify only missed insights to improve retrieval.
+                        tax_failed_ids = last_retrieval_result.get("taxonomy_failed_insight_ids", set())
+                        cond_failed_ids = last_retrieval_result.get("condition_failed_insight_ids", set())
+
+                        new_program_ins = []
+                        for ins in last_new_program_ins:
+                            ins_id = ins.get("insight_id")
+                            taxonomy_failed = ins_id in tax_failed_ids
+                            # condition_failed only if taxonomy matched successfully but condition failed
+                            condition_failed = ins_id in cond_failed_ids and ins_id not in tax_failed_ids
+                            if taxonomy_failed or condition_failed:
+                                modified_ins = llm_ins.modify_new_insight_for_retrieve(
+                                    iter=iter,
+                                    task=task,
+                                    insight=ins,
+                                    taxonomy_failed=taxonomy_failed,
+                                    condition_failed=condition_failed,
+                                    library=temp_library,
+                                    candidate_formulation=candidate_formulation,
+                                    verbose=False
+                                )
+                                new_program_ins.append(modified_ins)
+                                modified_insight_ids.add(ins_id)  # Track original insight_id that was modified
+                            else:
+                                # Already retrievable insights are kept as-is
+                                new_program_ins.append(ins)
+                    else:
+                        # Either first attempt or previous attempt had task failure:
+                        # regenerate new program insights from corrected program.
+                        new_program_ins = llm_ins.generate_insights(
+                            iter=iter,
+                            task=task,
+                            corrected_program=corrected_program, 
+                            taxonomy=taxo_snapshot,
+                            candidate_formulation=candidate_formulation,
+                            verbose=False,
+                            save_data=True,
+                            output_path=train_output_path
+                        )
+
+                    if not new_program_ins:
+                        # Nothing to verify in this attempt
+                        continue
+
                     if is_optimal:
-                        #* Keep only those new insights that can solve its source task when applied back
-                        is_verify = self_verify_test(iter, task, llm_opt, new_program_ins, prev_insights, True, train_output_path)
+                        #* Verify both task success and retrieval for new program insights
+                        # Add new_program_ins to temp_library before verification (thread-safe)
+                        temp_library.add_insights_update_ids(new_program_ins, iter, lock=lock)
 
-                        if is_verify:
-                            # print(f"\n   [Task {task.id}]: The new program insights are self-verified at attempt {attempt}!")
-                            task_new_insights.extend(new_program_ins)
+                        # Combined verification wrapper: task success + retrieval
+                        is_verify, verified_insights, task_success, retrieval_result = self_verify_retrieval_and_success(
+                            iter=iter,
+                            task=task,
+                            llm_opt=llm_opt,
+                            new_insights=new_program_ins,
+                            prev_insights=prev_insights,
+                            library=temp_library,  # Use temp_library instead of library
+                            llm_retri=llm_retri,
+                            candidate_formulation=candidate_formulation,
+                            save_data=True,
+                            output_path=train_output_path
+                        )
+
+                        # Count this self-verify attempt
+                        iter_self_verify_total += 1
+
+                        # Remove unverified insights of the task from temp_library
+                        temp_library.remove_unverified_insights(new_program_ins, is_verify, verified_insights, lock=lock)
+
+                        if not task_success:
+                            # Case: task failed -> try regenerate on next attempt
+                            last_new_program_ins = None
+                            last_retrieval_result = None
+                            continue
+
+                        # From here on, task_success == True
+                        last_new_program_ins = new_program_ins
+                        last_retrieval_result = retrieval_result
+
+                        if is_verify and verified_insights:
+                            # Task success + full retrieval (full ⊂ success)
+                            iter_self_verify_success_tasks += 1
+                            iter_self_verify_full_retrieval_tasks += 1
+                            # Check if any modified insights were verified successfully
+                            if modified_insight_ids:
+                                verified_modified_ids = [v_ins.get("insight_id") for v_ins in verified_insights if v_ins.get("insight_id") in modified_insight_ids]
+                                if verified_modified_ids:
+                                    print(f"✅ [Task {task.id}] Modified program insights were verified successfully at attempt {attempt_num}! Modified insight IDs: {verified_modified_ids}")
+                            task_new_insights.extend(verified_insights)
                             is_need_formu_ins = False
                             break
+                        elif verified_insights:
+                            # Task success + partial retrieval (partial ⊂ success)
+                            iter_self_verify_success_tasks += 1
+                            iter_self_verify_partial_retrieval_tasks += 1
+                            # Check if any modified insights were verified successfully
+                            if modified_insight_ids:
+                                verified_modified_ids = [v_ins.get("insight_id") for v_ins in verified_insights if v_ins.get("insight_id") in modified_insight_ids]
+                                if verified_modified_ids:
+                                    print(f"✅ [Task {task.id}] Modified program insights were verified successfully (partial) at attempt {attempt_num}! Modified insight IDs: {verified_modified_ids}")
+                            # Track best partial insights across attempts
+                            if len(verified_insights) > len(best_verified_insights):
+                                best_verified_insights = verified_insights
+                            # Do NOT break here; next attempt will refine missed insights
+                            continue
+                        else:
+                            # Task success but no insights retrieved: rely on refinement in next attempts
+                            continue
                     else:
                         # If not optimal only use new_program_ins for generating runnable programs
                         break
-                # The for loop has no break statement (i.e., is_optimal but is_verify never is True)
+                # The for loop has no break statement (i.e., no full retrieval achieved)
                 else: 
-                    fail_to_verify_program_ins += 1  
-                    if fail_to_verify_program_ins == failures:
-                        is_verify = False
-                        task.fail_to_verify += 1
+                    # Fallback: if we ever had partial retrieval, keep the best partial insights
+                    if best_verified_insights:
+                        iter_self_verify_success_tasks += 1
+                        iter_self_verify_partial_retrieval_tasks += 1
+                        task_new_insights.extend(best_verified_insights)
                         is_need_formu_ins = False
+                    else:
+                        fail_to_verify_program_ins += 1  
+                        if fail_to_verify_program_ins == failures:
+                            is_verify = False
+                            task.fail_to_verify += 1
+                            is_need_formu_ins = False
                     continue
             
             if is_need_formu_ins:
@@ -211,32 +329,133 @@ def run_library_online_learning(
                         # continue: for next failure of this task try self-explore again
                         # break: only try once self-explore per task using the first failed formulation
 
-                for attempt in range(1, params.max_verify_attempts + 1):
-                    #* Extract new insights from the correction
-                    new_formu_ins = llm_ins.generate_insights(
+                # Track best partial retrieval across attempts
+                last_new_formu_ins = None
+                last_retrieval_result = None
+                best_verified_insights = []
+
+                for attempt_num in range(1, params.max_verify_attempts + 1):
+                    # Decide whether to regenerate or to modify missed insights
+                    modified_insight_ids = set()  # Track which insights were modified in this attempt
+                    if last_retrieval_result is not None:
+                        # Task was successful but retrieval was partial/none:
+                        # skip regenerate and modify only missed insights to improve retrieval.
+                        tax_failed_ids = last_retrieval_result.get("taxonomy_failed_insight_ids", set())
+                        cond_failed_ids = last_retrieval_result.get("condition_failed_insight_ids", set())
+
+                        new_formu_ins = []
+                        for ins in last_new_formu_ins:
+                            ins_id = ins.get("insight_id")
+                            taxonomy_failed = ins_id in tax_failed_ids
+                            # condition_failed only if taxonomy matched successfully but condition failed
+                            condition_failed = ins_id in cond_failed_ids and ins_id not in tax_failed_ids
+                            if taxonomy_failed or condition_failed:
+                                modified_ins = llm_ins.modify_new_insight_for_retrieve(
+                                    iter=iter,
+                                    task=task,
+                                    insight=ins,
+                                    taxonomy_failed=taxonomy_failed,
+                                    condition_failed=condition_failed,
+                                    library=temp_library,
+                                    candidate_formulation=candidate_formulation,
+                                    verbose=False
+                                )
+                                new_formu_ins.append(modified_ins)
+                                modified_insight_ids.add(ins_id)  # Track original insight_id that was modified
+                            else:
+                                # Already retrievable insights are kept as-is
+                                new_formu_ins.append(ins)
+                    else:
+                        # Either first attempt or previous attempt had task failure:
+                        # regenerate new formulation insights from failed formulation.
+                        new_formu_ins = llm_ins.generate_insights(
+                            iter=iter,
+                            task=task,
+                            failed_formulation=candidate_formulation,
+                            taxonomy=taxo_snapshot,
+                            verbose=False,
+                            save_data=True,
+                            output_path=train_output_path
+                        )
+
+                    if not new_formu_ins:
+                        # Nothing to verify in this attempt
+                        continue
+
+                    # print(f"New formulation insights: {new_formu_ins}")
+                    new_insights = new_formu_ins + new_program_ins
+                    
+                    #* Add new_insights to temp_library before verification (thread-safe)
+                    temp_library.add_insights_update_ids(new_insights, iter, lock=lock)
+
+                    #* Verify both task success and retrieval for formulation + program insights
+                    is_verify, verified_insights, task_success, retrieval_result = self_verify_retrieval_and_success(
                         iter=iter,
                         task=task,
-                        failed_formulation=candidate_formulation,
-                        taxonomy=taxo_snapshot,
-                        verbose=False,
+                        llm_opt=llm_opt,
+                        new_insights=new_insights,
+                        prev_insights=prev_insights,
+                        library=temp_library,  # Use temp_library instead of library
+                        llm_retri=llm_retri,
+                        candidate_formulation=candidate_formulation,
                         save_data=True,
                         output_path=train_output_path
                     )
+                    iter_self_verify_total += 1
+                    
+                    # Remove unverified insights from temp_library to maintain accurate context
+                    temp_library.remove_unverified_insights(new_insights, is_verify, verified_insights, lock=lock)
+                    
+                    if not task_success:
+                        # Case: task failed -> try regenerate on next attempt
+                        last_new_formu_ins = None
+                        last_retrieval_result = None
+                        continue
 
-                    new_insights = new_formu_ins + new_program_ins
-                    #* Keep only those new insights that can solve its source task when applied back
-                    is_verify = self_verify_test(iter, task, llm_opt, new_insights, prev_insights, True, train_output_path)
+                    # From here on, task_success == True
+                    last_new_formu_ins = new_formu_ins
+                    last_retrieval_result = retrieval_result
 
-                    if is_verify:
-                        # print(f"\n   [Task {task.id}]: The new formulation insights are self-verified at attempt {attempt}!")
-                        task_new_insights.extend(new_insights)
+                    if is_verify and verified_insights:
+                        # Task success + full retrieval (full ⊂ success)
+                        iter_self_verify_success_tasks += 1
+                        iter_self_verify_full_retrieval_tasks += 1
+                        # Check if any modified insights were verified successfully
+                        if modified_insight_ids:
+                            verified_modified_ids = [v_ins.get("insight_id") for v_ins in verified_insights if v_ins.get("insight_id") in modified_insight_ids]
+                            if verified_modified_ids:
+                                print(f"✅ [Task {task.id}] Modified formulation insights were verified successfully at attempt {attempt_num}! Modified insight IDs: {verified_modified_ids}")
+                        task_new_insights.extend(verified_insights)
                         break
+                    elif verified_insights:
+                        # Task success + partial retrieval (partial ⊂ success)
+                        iter_self_verify_success_tasks += 1
+                        iter_self_verify_partial_retrieval_tasks += 1
+                        # Check if any modified insights were verified successfully
+                        if modified_insight_ids:
+                            verified_modified_ids = [v_ins.get("insight_id") for v_ins in verified_insights if v_ins.get("insight_id") in modified_insight_ids]
+                            if verified_modified_ids:
+                                print(f"✅ [Task {task.id}] Modified formulation insights were verified successfully (partial) at attempt {attempt_num}! Modified insight IDs: {verified_modified_ids}")
+                        # Track best partial insights across attempts
+                        if len(verified_insights) > len(best_verified_insights):
+                            best_verified_insights = verified_insights
+                        # Do NOT break here; next attempt will refine missed insights
+                        continue
+                    else:
+                        # Task success but no insights retrieved: rely on refinement in next attempts
+                        continue
+                # The for loop has no break statement (i.e., no full retrieval achieved)
                 else:
-                    fail_to_verify_formu_ins += 1  
-                    if fail_to_verify_formu_ins == failures:
-                        is_verify = False
-                        task.fail_to_verify += 1
-                        # print(f"\n   [Task {task.id}]: The new formulation insights failed to self-verify at max attempts!")
+                    # Fallback: if we ever had partial retrieval, keep the best partial insights
+                    if best_verified_insights:
+                        iter_self_verify_success_tasks += 1
+                        iter_self_verify_partial_retrieval_tasks += 1
+                        task_new_insights.extend(best_verified_insights)
+                    else:
+                        fail_to_verify_formu_ins += 1  
+                        if fail_to_verify_formu_ins == failures:
+                            is_verify = False
+                            task.fail_to_verify += 1
 
         #* Conduct merge on task-specific insights
         for idx, ins in enumerate(task_new_insights):
@@ -260,29 +479,46 @@ def run_library_online_learning(
 
             task_new_insights = task_new_insights_not_merged + verified_merged_insights
 
-        return task_new_insights, is_success, is_execution, is_verify, is_self_explore
+        return task_new_insights, all_attempts_optimal, is_execution, is_verify, is_self_explore, first_attempt_optimal
 
     # Experiment metrics 
     train_success_flags = [False] * len(train_tasks)
 
     fail_to_execute_lst = []
 
-    iter_verify_count = 0
-    iter_verify_success = 0
     fail_to_verify_lst = []
 
     iter_explore_count = 0
     iter_explore_success = 0
     fail_to_explore_lst = []
 
+    # Counters for self_verify_retrieval_and_success outcomes
+    iter_self_verify_total = 0
+    # "success" here means: task solved when applying new insights (either full or partial retrieval)
+    iter_self_verify_success_tasks = 0
+    iter_self_verify_full_retrieval_tasks = 0     # subset of success: task success + full retrieval
+    iter_self_verify_partial_retrieval_tasks = 0  # subset of success: task success + partial retrieval
+
     batch_verified_merge_rate = []
     batch_insight_merge_rate = []
+
+    # Counters for online merge rate calculation
+    total_online_merge_attempts = 0
+    total_online_merge_successes = 0
     
     train_start_time = time.time()
+    usage_before = get_token_usage()
 
     for start in range(0, len(train_tasks), params.batch_size):
         batch = train_tasks[start:start + params.batch_size] 
         batch_new_insights = []  # Aggregate the new insights generated in this batch
+        
+        # Create temp_library for this batch (deepcopy of library)
+        # This will accumulate insights from all tasks in the batch for verification
+        temp_library = copy.deepcopy(library)
+        # Lock to safely update shared variables across tasks
+        temp_library_lock = Lock()
+        
         batch_train_start_time = time.time()
         with ThreadPoolExecutor(max_workers=params.batch_size) as executor:
             futures = {
@@ -290,7 +526,9 @@ def run_library_online_learning(
                     _train_worker,
                     task,
                     copy.deepcopy(library.taxonomy),                # pass a snapshot to avoid concurrent writes
-                    os.path.join(paths.train_output_dir, f"task_{task.id}")     # per-task output folder
+                    os.path.join(paths.train_output_dir, f"task_{task.id}"),     # per-task output folder
+                    temp_library,                                  # pass temp_library for batch-level verification
+                    temp_library_lock                              # pass lock for thread-safe updates
                 ): (start+i, task)
                 for i, task in enumerate(batch)
             }
@@ -299,12 +537,7 @@ def run_library_online_learning(
             for future in tqdm(as_completed(futures), total=len(batch), desc=f"[Iteration {iter}] Library Online Learning Phase Batch {batch_idx} (tasks {start+1}-{start+len(batch)}) \n"):
                 # (start+i, task)
                 idx, task = futures[future]
-                new_insights, is_success, is_execution, is_verify, is_self_explore = future.result()
-
-                if is_success is False and is_verify is not None:
-                    iter_verify_count += 1
-                    if is_verify:
-                        iter_verify_success += 1
+                new_insights, all_attempts_optimal, is_execution, is_verify, is_self_explore, first_attempt_optimal = future.result()
 
                 if is_execution is False:
                     fail_to_execute_lst.append(task.id)
@@ -323,7 +556,8 @@ def run_library_online_learning(
                     # Temporarily store new insights of this batch
                     batch_new_insights.extend(new_insights)
 
-                train_success_flags[idx] = is_success
+                # train_accuracy is based on first attempt optimal status
+                train_success_flags[idx] = first_attempt_optimal
 
         #* Once this batch is completed, new insights will be added into the library 
         if batch_new_insights: 
@@ -336,8 +570,10 @@ def run_library_online_learning(
                         ins["insight_id"] = idx
                     merged_batch_new_insights = llm_ins.conduct_insight_merge(candidate_insights=batch_new_insights, target=f"Batch {batch_idx}", verbose=True) 
                     num_all_merged = len(merged_batch_new_insights)
+                    total_num_all_merged += num_all_merged
                 else:
                     merged_batch_new_insights = []
+                    num_all_merged = 0
                 #* Verify the merged insight(s) if any 
                 if merged_batch_new_insights: 
                     all_tasks_new_insights = []
@@ -347,7 +583,6 @@ def run_library_online_learning(
                         prev_insights = library.retrieve_insights_by_id(prev_ins_ids) if prev_ins_ids else []
 
                         # Obtain new insights of specific task 
-                        # TODO task_new_insights = [ins for ins in batch_new_insights if ins["task_id"] == task.id] 
                         # Handle both single task_id and list of task_ids (for merged insights)
                         task_new_insights = []
                         for ins in batch_new_insights:
@@ -365,7 +600,6 @@ def run_library_online_learning(
 
                     #* Add insights not merged of each task
                     for task in batch:
-                        # TODO task_new_insights = [ins for ins in batch_new_insights if ins["task_id"] == task.id]
                         # Handle both single task_id and list of task_ids (for merged insights)
                         task_new_insights = []
                         for ins in batch_new_insights:
@@ -387,6 +621,8 @@ def run_library_online_learning(
                     all_tasks_new_insights = batch_new_insights
 
                 print(f"Batch {batch_idx} has {len(all_tasks_new_insights)} insights after merge!")
+                # Track self-verified merged group count for this batch (success count)
+                total_num_self_verified_merged += len(merged_batch_new_insights) if merged_batch_new_insights else 0
 
                 #* Online merge with existing library insights for each new insight
                 online_merge_success_count = 0
@@ -396,9 +632,7 @@ def run_library_online_learning(
                 
                 for new_insight in all_tasks_new_insights:
                     # Conduct online merge with existing library insights
-                    # import pdb; pdb.set_trace()
-
-                    merged_insights, _, existing_insights = llm_ins.conduct_insight_online_merge(
+                    merged_insights, _, parent_ids = llm_ins.conduct_insight_online_merge(
                         new_insight=[new_insight],  # Wrap in list as expected by the method
                         library=library,
                         verbose=True
@@ -407,7 +641,6 @@ def run_library_online_learning(
                     # If no merge occurred, add original insight directly
                     if not merged_insights:
                         library.add_insights([new_insight], iter)
-                        library.update_taxonomy(new_insight)
                         print(f"No merge occurred for task {new_insight['task_id']}, adding original insight!")
                         continue
                     
@@ -435,6 +668,7 @@ def run_library_online_learning(
                             # Handle both single task_id and list of task_ids (for merged insights)
                             task_new_insights = []
                             for ins in all_tasks_new_insights:
+                                # exclude current new_insight
                                 if ins != new_insight:
                                     task_id = ins.get('task_id')
                                     if isinstance(task_id, list):
@@ -453,16 +687,15 @@ def run_library_online_learning(
                                     task_id = ins.task_id
                                     if isinstance(task_id, list):
                                         if task.id in task_id:
-                                            # Check if this insight was merged (excluded from merged_insights)
-                                            if ins not in existing_insights:
+                                            # Exclude only the parents that were actually merged
+                                            if ins.insight_id not in parent_ids:
                                                 task_new_insights.append(ins.to_dict())
                                     elif task_id == task.id:
-                                        # Check if this insight was merged (excluded from merged_insights)
-                                        if ins not in existing_insights:
+                                        # Exclude only the parents that were actually merged
+                                        if ins.insight_id not in parent_ids:
                                             task_new_insights.append(ins.to_dict())
                             task_new_insights.append(merged_insights)
 
-                        # print("task_new_insights", task_new_insights)
                         is_verify = self_verify_test(iter=None, task=task, llm_opt=llm_opt, new_insights=task_new_insights, prev_insights=prev_insights)
                         if not is_verify:
                             all_tasks_verified = False
@@ -470,17 +703,50 @@ def run_library_online_learning(
                     
                     # Only add merged insights if all tasks are verified successfully
                     if all_tasks_verified:
+                        # Compute merge_version from parent insights (depth-style: max(parent)+1)
+                        parent_versions = []
+                        if parent_ids:
+                            for _ins in library:
+                                if _ins.insight_id in parent_ids:
+                                    parent_versions.append(getattr(_ins, "merge_version", 0))
+                        merged_insights["merge_version"] = (max(parent_versions) if parent_versions else 0) + 1
+                        # Reset refine_version for a newly merged insight
+                        merged_insights["refine_version"] = 0
+
+                        # If taxonomy is invalid (e.g., a plain string), skip this merged insight to avoid crashes/data loss.
+                        taxo = merged_insights.get("taxonomy")
+                        if not isinstance(taxo, dict):
+                            # Try JSON-dict string
+                            if isinstance(taxo, str) and taxo.strip().startswith("{") and taxo.strip().endswith("}"):
+                                try:
+                                    parsed = json.loads(taxo)
+                                except Exception:
+                                    parsed = None
+                                if isinstance(parsed, dict):
+                                    merged_insights["taxonomy"] = parsed
+                                else:
+                                    parsed = None
+                            else:
+                                parsed = None
+
+                            if not isinstance(merged_insights.get("taxonomy"), dict):
+                                print(
+                                    f"[WARNING] Merged insight has invalid taxonomy; skipping merged insight and keeping parents. "
+                                    f"taxonomy_type={type(taxo).__name__}"
+                                )
+                                library.add_insights([new_insight], iter)
+                                print(f"Online merge skipped for task {new_insight['task_id']} due to invalid taxonomy, adding original insight!")
+                                continue
+
                         # Replace existing insights that were merged and add merged insights immediately
-                        library.replace_merged_insights(existing_insights)
+                        library.replace_merged_insights([{"insight_id": pid} for pid in parent_ids])
                         library.add_insights([merged_insights], iter)
-                        library.update_taxonomy(merged_insights)
                         online_merge_success_count += 1
                         total_online_merge_successes += 1
                         print(f"Successfully merged insight for task {new_insight['task_id']} with existing library insights!")
                     else:
                         # If verification fails, add original insight immediately
                         library.add_insights([new_insight], iter)
-                        library.update_taxonomy(new_insight)
                         print(f"Online merge failed for task {new_insight['task_id']}, adding original insight!")
 
                 # Calculate online merge rate for this batch
@@ -504,11 +770,29 @@ def run_library_online_learning(
 
     train_duration = cal_time_cost(train_start_time, f'Iteration {iter} Library Online Learning Phase')
 
+    # Token usage summary for this phase
+    usage_after = get_token_usage()
+    token_usage_delta = {}
+    for vendor, stats_after in usage_after.items():
+        stats_before = usage_before.get(vendor, {})
+        vendor_delta = {
+            k: float(stats_after.get(k, 0.0) - stats_before.get(k, 0.0))
+            for k in ("requests", "prompt_tokens", "completion_tokens", "total_tokens", "cost")
+        }
+        # Only include vendors with non-zero cost
+        if vendor_delta.get("cost", 0.0) != 0.0:
+            token_usage_delta[vendor] = vendor_delta
+
     # Calculate the success rate for this iteration
     number_of_train_failures = len(train_success_flags) - sum(train_success_flags)
     train_accuracy = sum(train_success_flags) / len(train_success_flags) if train_success_flags else 0
-    verify_success_rate = (iter_verify_success / iter_verify_count) if iter_verify_count > 0 else 0
     explore_success_rate = (iter_explore_success / iter_explore_count) if iter_explore_count > 0 else 0
+
+    # Calculate detailed self-verify + retrieval statistics (based on self_verify_retrieval_and_success)
+    self_verify_total = iter_self_verify_total if iter_self_verify_total > 0 else 1
+    self_verify_task_success_rate = iter_self_verify_success_tasks / self_verify_total
+    self_verify_full_retrieval_rate = iter_self_verify_full_retrieval_tasks / self_verify_total
+    self_verify_partial_retrieval_rate = iter_self_verify_partial_retrieval_tasks / self_verify_total
     
     # Calculate batch-level metrics using np.nanmean for consistent handling of None values
     verified_merge_rate = np.nanmean([x if x is not None else np.nan for x in batch_verified_merge_rate])
@@ -516,6 +800,12 @@ def run_library_online_learning(
     
     # Calculate overall online merge rate
     overall_online_merge_rate = (total_online_merge_successes / total_online_merge_attempts) if total_online_merge_attempts > 0 else 0
+
+    # Self-verify (group merge) success rate: accepted groups / proposed groups
+    self_verify_online_merge_success_rate = (
+        total_num_self_verified_merged / total_num_all_merged
+        if total_num_all_merged > 0 else 0
+    )
     
     # Record library learning success log
     iter_metrics = {
@@ -524,16 +814,103 @@ def run_library_online_learning(
         "train_accuracy": round(train_accuracy, 3),
         "library_size": len(library),
         "number_of_train_failures": number_of_train_failures,
-        "self_verify_rate": round(verify_success_rate, 3),
+        "self_verify_task_success_rate": round(self_verify_task_success_rate, 3),
+        # Raw counters
+        "iter_self_verify_total": iter_self_verify_total,
+        "total_online_merge_attempts": total_online_merge_attempts,
+        "num_all_merged": total_num_all_merged,
         "self_explore_success_rate": round(explore_success_rate, 3),
-        "insight_merge_rate": round(insight_merge_rate, 3),
-        "verified_merge_rate": round(verified_merge_rate, 3),
-        "online_merge_rate": round(overall_online_merge_rate, 3),
+        "batch_merge_rate": round(insight_merge_rate, 3),
+        "batch_avg_verified_merge_success_rate": round(verified_merge_rate, 3),
+        # Requested per-iter metrics (kept alongside existing keys for backward compatibility)
+        # 1) online merge accept/success counts / online merge proposed by LLM
+        "online_merge_success_rate": round(overall_online_merge_rate, 3),
+        "online_merge_success_num": int(total_online_merge_successes),
+        "online_merge_proposed_num": int(total_online_merge_attempts),
+        # 4) self-verify merged-group success counts / merged-group proposed by LLM
+        "self_verify_online_merge_success_rate": round(float(self_verify_online_merge_success_rate), 3),
+        "self_verify_online_merge_success_num": int(total_num_self_verified_merged),
+        "self_verify_online_merge_proposed_num": int(total_num_all_merged),
+        # 5/6) self-verify new-insight success counts / new-insight verify calls
+        "self_verify_new_insight_full_success_rate": round(float(iter_self_verify_full_retrieval_tasks / iter_self_verify_total), 3) if iter_self_verify_total > 0 else 0,
+        "self_verify_new_insight_full_success_num": int(iter_self_verify_full_retrieval_tasks),
+        "self_verify_new_insight_partial_success_rate": round(float(iter_self_verify_partial_retrieval_tasks / iter_self_verify_total), 3) if iter_self_verify_total > 0 else 0,
+        "self_verify_new_insight_partial_success_num": int(iter_self_verify_partial_retrieval_tasks),
         "number_of_train_tasks": len(train_tasks),
         "fail_to_execute_task_ids": fail_to_execute_lst,
         "fail_to_explore_task_ids": fail_to_explore_lst,
         "fail_to_verify_task_ids": fail_to_verify_lst,
         "online_learning_duration (min)": train_duration,
+        "token_usage": token_usage_delta,
     }
 
     return iter_metrics
+
+
+if __name__ == "__main__":
+    from datetime import datetime
+
+    from src.dataloader import DataLoader
+    from src.utils import cal_time_cost
+    from src.train_eval_utils import save_checkpoint
+    from src.experience_library import ExperienceLibrary
+    from src.llm_programmer import ProgramGenerator
+    from src.llm_diagnostic import ProgramDiagnostic
+    from src.llm_extractor import InsightExtractor
+    from src.llm_retriever import LibraryRetrieval
+
+    #* Configure
+    from omegaconf import OmegaConf
+    config = OmegaConf.load("train_config.yaml")
+
+    # Generate a timestamp and append it to output_folder
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    config.output_folder = f"{config.output_folder}_{ts}"
+    # Re-resolve
+    OmegaConf.resolve(config)
+
+    # Initialize the LLM agents
+    llm_opt = ProgramGenerator(model=config.base_model, service=config.service, temperature=0)
+    llm_opt_online = ProgramGenerator(model=config.base_model, service=config.service, temperature=0)
+    llm_diag = ProgramDiagnostic(model=config.advanced_model, service=config.service, temperature=0)
+    llm_ins = InsightExtractor(model=config.advanced_model, service=config.service, temperature=0.7)
+
+    if config.params.max_solution_attempts > 1:
+        llm_opt_online = ProgramGenerator(model=config.base_model, temperature=0.7)
+
+    # Load task recorded previously
+    train_tasks = DataLoader(config.file_paths.train_data_path, mode="learn", filter_success_num=None, reset=True) 
+
+    # Initialize an empty library
+    library = ExperienceLibrary()
+    metrics_log = []
+
+    # Run subset
+    if config.data_slice:
+        start = config.data_slice[0]
+        end = config.data_slice[1]
+        train_tasks = train_tasks.slice(start, end)
+
+    start_time = time.time()
+    iter = 0
+
+    # Update library retriever
+    llm_retri = LibraryRetrieval(lib=library, model=config.base_model, service=config.service, temperature=0)
+
+    #* Library Online Learning
+    iter_metrics = run_library_online_learning(
+        iter, 
+        train_tasks, 
+        llm_retri, llm_opt, llm_diag, llm_ins, library, 
+        config.params,
+        config.file_paths
+    )
+
+    print(iter_metrics)
+
+    # Save checkpoint
+    metrics_log.append(iter_metrics)
+    save_checkpoint(library=library, tasks=train_tasks, metrics=metrics_log, paths=config.file_paths, suffix="base")
+
+    # Count time cost
+    total_duration = cal_time_cost(start_time, f'The library online learning process')

@@ -5,10 +5,9 @@ To better solve optimization tasks, we maintain an experience library that provi
 
 You are given:
 
-1. The insight to be refined, consisting of three fields:
+1. The insight to be refined, consisting of two fields:
 	- condition: A trigger specifying when the insight applies, grounded in problem description/domain features. It first states the general situation, then illustrates with the specific problem.
 	- explanation: Under this condition, the description outlines the best practice, the common mistake and its cause. It illustrates the issue with this problem as an example and generalizes the correct modeling strategy it reflects.
-	- example: Wrong vs. correct demonstration (principle, formula, or code).
 
 2. The problem description of an optimization problem for which this insight your colleague thought is not applicable.
 
@@ -69,10 +68,9 @@ To better solve optimization tasks, we maintain an experience library that provi
 
 You are given:
 
-1. The insight to be refined, consisting of three fields:
+1. The insight to be refined, consisting of two fields:
 	- condition: A trigger specifying when the insight applies, grounded in problem description/domain features. It first states the general situation, then illustrates with the specific problem.
 	- explanation: Under this condition, the description outlines the best practice, the common mistake and its cause. It illustrates the issue with this problem as an example and generalizes the correct modeling strategy it reflects.
-	- example: Wrong vs. correct demonstration (principle, formula, or code).
 
 2. The problem description of an optimization problem for which this insight your colleague thought is not applicable.
 
@@ -128,19 +126,15 @@ PROMPT_INS_REFINEMENT="""
 You are an expert in Industrial Engineering and Operations Research. Your task is to **design multiple refinement strategies** for the **condition** of a given insight to improve its applicability in optimization tasks.
 
 You are given:	
-1. Original insight with three fields:
-    - condition: Trigger specifying when the insight applies, grounded in problem description/domain features. It first States the general situation, then illustrates with the specific problem.
-    - explanation: Under this condition, the description outlines the best practice, the common mistake and its cause. It illustrates the issue with this problem as an example and generalizes the correct modeling strategy it reflects.
-    - example: Wrong vs. correct demonstration (principle, formula, or code).
+1. The original applicability condition of an insight:
+    Trigger specifying when the insight applies, grounded in problem description/domain features. It first States the general situation, then illustrates with the specific problem.
 	
 2. Task-derived insight conditions:
 - **Inapplicability conditions** of insights for **negative tasks** where prior use of the insight misled the modeling.
 - **Applicability conditions** of insights for **unretrieved tasks** which should have retrieved these insights but were missed.
 
-Applicability conditions for unretrieved tasks where the insight was relevant but not retrieved.
-
-## The original insight to be refined
-{original_insight}
+## The original applicability condition to be refined
+{original_condition}
 
 ### inapplicability conditions from negative tasks
 {neg_conditions}
@@ -156,24 +150,24 @@ Step 1: **Consolidate inapplicability:** Merge all inapplicability conditions fr
 **Use the pattern:** 
 	"This insight does NOT apply when [general situation that negates the insight]. For example, when the problem statement mentions [concrete trigger(s) grounded in the problem description or defining features indicating properties that conflict with the insight]."
 
-Step 2: **Consolidate applicability**: Merge all applicability conditions from unretrieved tasks into a single, unified applicability condition.
+Step 2: **Consolidate applicability**: 
+    - Merge all applicability conditions from unretrieved tasks into a single, unified applicability condition.
+	- Merge the original applicability condition with the unified applicability condition.
 **Use the pattern:** 
 	"This insight applies when [general situation that warrants the insight]. For example, when the problem statement mentions [concrete trigger(s) grounded in the problem description or defining features indicating properties that align with this insight]."
 	
-Step 3: **Integrate into the insight's condition field**:
-	- Preserve the original condition text verbatim.
-	- Structure the field as three paragraphs using the pattern below.
-	- Use the unified inapplicability condition as the second paragraph.
-**Output using the pattern (three brief paragraphs)**:
-	- First paragraph: original applicability condition
-	- Second paragraph: unified applicability condition for unretrieved tasks: "This insight applies when …"
-	- Third paragraph: unified inapplicability condition for negative tasks: "This insight does NOT apply when … "
+Step 3: **Integrate into a new condition and strictly follow the pattern below**: 
+	- First paragraph: unified applicability condition merged from the original condition and that from unretrieved tasks: "This insight applies when …" 
+	- Second paragraph: unified inapplicability condition for negative tasks: "This insight does NOT apply when … "
 
-Step 4: **Generate {path_k} distinct refinement strategies (paths):** Generate distinct refinement strategies (paths) for how you consolidate the insight conditions. For each path, write applicability/inapplicability using the required pattern in Step 3.
+Step 4: **Generate {path_k} distinct refinement strategies (paths):**
+    - Generate distinct refinement strategies (paths) for how you consolidate the insight conditions. 
+	- For each path, write applicability/inapplicability using the required pattern in Step 3. 
+	- Do not simply concatenate all condition examples or triggers; when some examples or triggers are similar, merge them using more general language.
 Examples: 
 	- one broad rule: Merge multiple situations into a single general trigger that clearly and broadly covers the main applicable scenario.
 	- short OR list: Provide a brief list of alternative triggers; if any one appears, the insight applies.
-	- must-have pair: Require two key cues to occur together before the insight applies, reducing false positives.
+	- must-have pair: Require several key cues to occur together before the insight applies, reducing false positives.
 	- info stated vs. missing: Apply only when the problem explicitly states the required details; treat omissions as not applicable.
 	- helpful keywords: Anchor applicability on a small set of representative keywords or phrases that reliably signal the scenario.
 	- narrow the scope: Add concise qualifiers to limit coverage to a well-bounded context so the insight applies only under those limits.

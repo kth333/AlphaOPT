@@ -2,12 +2,125 @@ import os
 import re
 import time
 import json
-from typing import Any, Callable
+from typing import Any, Callable, Dict
+from copy import deepcopy
+import threading
 from dotenv import load_dotenv
 
 #* Configure
 from omegaconf import OmegaConf
 config = OmegaConf.load("train_config.yaml")
+
+
+# ==== Global token usage tracker ====
+TOKEN_USAGE: Dict[str, Dict[str, float]] = {
+    "openai": {
+        "requests": 0,
+        "prompt_tokens": 0.0,
+        "completion_tokens": 0.0,
+        "total_tokens": 0.0,
+        "cost": 0.0,
+    },
+    "openrouter": {
+        "requests": 0,
+        "prompt_tokens": 0.0,
+        "completion_tokens": 0.0,
+        "total_tokens": 0.0,
+        "cost": 0.0,
+    },
+    "gemini": {
+        "requests": 0,
+        "prompt_tokens": 0.0,   # from count_tokens
+        "completion_tokens": 0.0,
+        "total_tokens": 0.0,
+        "cost": 0.0,
+    },
+}
+
+# Protect TOKEN_USAGE updates under multithreading.
+_TOKEN_USAGE_LOCK = threading.Lock()
+
+
+def _record_usage(
+    vendor: str,
+    prompt_tokens: float | None = None,
+    completion_tokens: float | None = None,
+    total_tokens: float | None = None,
+    cost: float | None = None,
+) -> None:
+    """
+    Update global TOKEN_USAGE in-place.
+    """
+    if vendor not in TOKEN_USAGE:
+        return
+    with _TOKEN_USAGE_LOCK:
+        usage = TOKEN_USAGE[vendor]
+        usage["requests"] += 1
+        if prompt_tokens is not None:
+            usage["prompt_tokens"] += float(prompt_tokens)
+        if completion_tokens is not None:
+            usage["completion_tokens"] += float(completion_tokens)
+        if total_tokens is not None:
+            usage["total_tokens"] += float(total_tokens)
+        if cost is not None:
+            usage["cost"] += float(cost)
+
+
+def _estimate_cost(
+    vendor: str,
+    model: str,
+    prompt_tokens: float | None,
+    completion_tokens: float | None,
+) -> float:
+    """
+    Estimate USD cost for a single request based on token counts and config.pricing.
+    """
+    pricing = getattr(config, "pricing", None)
+    if pricing is None:
+        return 0.0
+
+    prompt_tokens = float(prompt_tokens or 0.0)
+    completion_tokens = float(completion_tokens or 0.0)
+
+    # Get vendor config (gemini / openai / openrouter)
+    vendor_cfg = getattr(pricing, vendor, None)
+    if vendor_cfg is None:
+        return 0.0
+
+    # Try exact model key first
+    model_cfg = getattr(vendor_cfg, model, None)
+    # For OpenRouter we may not know concrete model → use "default"
+    if model_cfg is None and vendor == "openrouter":
+        model_cfg = getattr(vendor_cfg, "default", None)
+
+    if model_cfg is None:
+        return 0.0
+
+    p_per_m = float(getattr(model_cfg, "prompt_per_million", 0.0))
+    c_per_m = float(getattr(model_cfg, "completion_per_million", 0.0))
+
+    prompt_cost = (prompt_tokens / 1_000_000.0) * p_per_m
+    completion_cost = (completion_tokens / 1_000_000.0) * c_per_m
+    return prompt_cost + completion_cost
+
+
+def get_token_usage() -> Dict[str, Dict[str, float]]:
+    """
+    Return a deep copy of current global token usage snapshot.
+    """
+    with _TOKEN_USAGE_LOCK:
+        return deepcopy(TOKEN_USAGE)
+
+
+def reset_token_usage() -> None:
+    """
+    Reset global token usage counters to zero.
+    """
+    global TOKEN_USAGE
+    with _TOKEN_USAGE_LOCK:
+        for vendor, stats in TOKEN_USAGE.items():
+            for k in stats.keys():
+                stats[k] = 0.0
 
 def _build_client(model: str, service: str):
     """
@@ -21,16 +134,14 @@ def _build_client(model: str, service: str):
     openai_key = config.api_keys.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
     
     if service and service.lower() != "null":
-        # OpenAI-compatible (includes vLLM)
+        # Treat non-null service as OpenRouter (OpenAI-compatible endpoint)
         from openai import OpenAI
-        base_url = "https://openrouter.ai/api/v1"   # "http://127.0.0.1:8014/v1"
-        # api_key = os.getenv("OPEN_ROUTER_KEY")    # "dummy-key"
-        # client = OpenAI(api_key=api_key, base_url=base_url)
+        base_url = "https://openrouter.ai/api/v1"
 
         if not openrouter_key:
             raise RuntimeError("OPEN_ROUTER_KEY is not set in config or environment")
         client = OpenAI(api_key=openrouter_key, base_url=base_url)
-        return "openai", client
+        return "openrouter", client
 
     # Gemini family
     if "gemini" in model.lower():
@@ -79,14 +190,43 @@ def call_llm_and_parse_with_retry(
         """
         Dispatch the request to the proper SDK and return raw text.
         """
-        # OpenAI call
-        if vendor == "openai":
+        # OpenAI / OpenRouter call (OpenAI-compatible)
+        if vendor in ("openai", "openrouter"):
             msgs = prompt if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
-            completion = client.chat.completions.create(
-                model=model,
-                messages=msgs,
-                temperature=temperature
+            # Build parameters dict
+            create_params = {
+                "model": model,
+                "messages": msgs,
+                "temperature": temperature
+            }
+            # Add frequency_penalty for OpenAI vendor only
+            if vendor == "openai":
+                create_params["frequency_penalty"] = 0.5
+            completion = client.chat.completions.create(**create_params)
+
+            # Token usage from Responses API
+            usage = getattr(completion, "usage", None)
+            prompt_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
+            completion_tokens = getattr(usage, "completion_tokens", None) if usage is not None else None
+            total_tokens = getattr(usage, "total_tokens", None) if usage is not None else None
+
+            # Estimate cost from token usage
+            cost = _estimate_cost(vendor, model, prompt_tokens, completion_tokens)
+            # If OpenRouter additionally provides usage.cost, you can choose to override or log separately
+            if vendor == "openrouter" and usage is not None:
+                explicit_cost = getattr(usage, "cost", None)
+                if explicit_cost is not None:
+                    # Prefer explicit cost if available
+                    cost = float(explicit_cost)
+
+            _record_usage(
+                vendor,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cost=cost,
             )
+
             return completion.choices[0].message.content
 
         # Gemini call
@@ -111,6 +251,33 @@ def call_llm_and_parse_with_retry(
                         temperature=temperature,
                     ),
                 )
+
+            # Prefer usage_metadata from response to get prompt + completion tokens
+            usage_meta = getattr(completion, "usage_metadata", None)
+            if usage_meta is not None:
+                prompt_tok = getattr(usage_meta, "prompt_token_count", None)
+                completion_tok = getattr(usage_meta, "candidates_token_count", None)
+                total_tok = getattr(usage_meta, "total_token_count", None)
+                cost = _estimate_cost("gemini", model, prompt_tok, completion_tok)
+                _record_usage(
+                    "gemini",
+                    prompt_tokens=prompt_tok,
+                    completion_tokens=completion_tok,
+                    total_tokens=total_tok,
+                    cost=cost,
+                )
+            else:
+                # Fallback: approximate total tokens via models.count_tokens (prompt only)
+                try:
+                    tokens = client.models.count_tokens(model=model, contents=prompt)
+                    total_tok = getattr(tokens, "total_tokens", None)
+                    if total_tok is not None:
+                        cost = _estimate_cost("gemini", model, total_tok, 0.0)
+                        _record_usage("gemini", prompt_tokens=total_tok, total_tokens=total_tok, cost=cost)
+                except Exception:
+                    # Counting is best-effort; do not fail the main request
+                    pass
+
             return completion.text
 
         raise RuntimeError("Unsupported vendor")

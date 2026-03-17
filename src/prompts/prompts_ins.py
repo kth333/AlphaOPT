@@ -5,20 +5,24 @@ You are given:
 1. A problem description for the optimization task
 2. A mathematical model proposed by your colleague which failed to yield an optimal solution when solved with the Gurobi optimizer (hereafter referred to as *the failed mathematical model*)
 3. The gold-standard program, which embodies the correct mathematical formulation of the optimization task
+4. Taxonomy dictionaries for the problem domain and formulation components
 
 
 ### Problem description
 {problem_description}
 
-
 ### The failed mathematical model
-(Note: the model is written in LaTeX and presented in a plain-text code block (```))
 {failed_formulation}
-
 
 ### The gold-standard program
 {correct_program}
 
+### Taxonomy Dictionaries
+**Domain Modeling**
+{domain_taxo}
+
+**General Formulation**
+{formulation_taxo}
 
 ### Your task
 Step 1: Compare the failed mathematical model with the correct mathematical model embodied in the gold-standard program to identify issues that prevent optimality. Note that variable names in the proposed model may differ from those in the gold-standard program. Please align them carefully based on the problem specification.
@@ -31,15 +35,20 @@ Each new insight must contain exactly four fields:
     - **Domain Modeling**: Level-1 = Problem Domain (e.g., "Network Flow"); Level-2 = Specific Technique (e.g., "Flow Conservation").
     - **General Formulation**: Level-1 = Formulation Component (e.g., "Variable Definition"); Level-2 = Specific Aspect/Pitfall (e.g., "Continuous vs. Discrete Confusion").
 
-    Taxonomy rule (nested-dict): `{{ Level-1 : {{ Level-2 : null | {{ "definition": "...", "condition": "..." }} }} }}`
-    - The taxonomy MUST always be expressed as a **three-level nested dict**: Level-1 → Level-2 → (null or a dict with "definition"/"condition").
-    - Pick **exactly one** Level-1 (existing key).
-    - Pick **one or more** Level-2 under that Level-1 (existing key or keys).
+   Taxonomy rule (nested-dict): 
+   {{
+     "Domain Modeling" | "General Formulation" : {{
+       <Level-1 label> : {{
+         <Level-2 label> : null | {{ "definition": "...", "condition": "..." }}
+       }}
+     }}
+   }}
+    - Pick **exactly one** Level-1 and **exactly one** Level-2 under that Level-1
     - For an existing Level-2, set its value to null.
     - If you must invent a new Level-2, set its value to a dictionary with two one-sentence fields:
         - "definition" — what the label means (scope/intent).
         - "condition" — when to apply the label (a general trigger grounded in the problem description or in the defining features of the problem domain).
-    - If you must invent a new Level-1, include ≥1 Level-2 under it; each invented Level-2 must provide both "definition" and "condition".
+    - If you must invent a new Level-1, include the Level-2 under it and that Level-2 must provide both "definition" and "condition".
 
 2) **condition** — Write it as a trigger explicitly grounded in the problem description or in the defining features of the problem domain. First state the general situation, then use this problem as an example. **Use the pattern below**, and keep it strictly non-prescriptive: do not give any solution, advice or decision:
 "This insight applies when ... For example, when the problem statement mentioned ...". 
@@ -50,12 +59,6 @@ Each new insight must contain exactly four fields:
 
 4) **example** — A brief, self-contained demonstration showing wrong vs. correct version (principle, formulation, or code snippet). Clearly mark them as '# Wrong' and '# Correct'.
 
-### Taxonomy Dictionaries
-**Domain Modeling**
-{domain_taxo}
-
-**General Formulation**
-{formulation_taxo}
 
 ### STRICT OUTPUT FORMAT
 Return a single JSON **array** of insight objects. No text before/after. Example with two insights (but not must be two):
@@ -101,6 +104,9 @@ You are an expert in Industrial Engineering and Operations Research teaching gra
 
 You are given:
 
+### Mathematical model of the optimization task
+{candidate_formulation}
+
 ### Corrected program with #=== fix blocks delimited by:
     #===
     # <brief issue comment>
@@ -109,6 +115,8 @@ You are given:
     #===
 {corrected_program}
 
+### Taxonomy Dictionary
+{code_taxo}
 
 ### Your Task  
 For each `#===` fix block in the corrected program, extract one or more **new insights**—each a distinct, concise lesson distilled from the commented-out coding mistake.
@@ -121,13 +129,12 @@ Each new insight must contain exactly four fields:
     Level-1 = Coding Area (e.g., "Solver & API Syntax"); Level-2 = Specific Aspect/Issue (e.g., "Library Import/Reference Errors").
 
     - Ensure that the outermost dictionary key is always "Code Implementation"
-    - Pick **exactly one** Level-1 (existing key).
-    - Pick **one or more** Level-2 under that Level-1 (existing key or keys).
+    - Pick **exactly one** Level-1 and **exactly one** Level-2 under that Level-1
     - For an existing Level-2, set its value to null.
     - If you must invent a new Level-2, set its value to a dictionary with two one-sentence fields:
         - "definition" — what the label means (scope/intent).
         - "condition" — when to apply the label (a general trigger explicitly grounded in the mathematical model).
-    - If you must invent a new Level-1, include ≥1 Level-2 under it; each invented Level-2 must provide both "definition" and "condition".
+    - If you must invent a new Level-1, includ the Level-2 under it; each invented Level-2 must provide both "definition" and "condition".
 
 2) **condition** — Write it as a trigger explicitly grounded in the mathematical model. State the general modeling pattern, then use this model as an example. Use the pattern: "This insight applies when the mathematical model contains... For example, when the formulation included...". Keep it strictly non-prescriptive: do not give any solution, advice or decision.
 
@@ -136,9 +143,6 @@ Each new insight must contain exactly four fields:
 "When the problem involves … . The best practice is … . A common mistake is … , which happens because … . More generally, this reflects that … ." 
 
 4) **example** — A brief, self-contained demonstration showing wrong vs. correct version (principle, formulation, or code snippet). Clearly mark them as '# Wrong' and '# Correct'.
-
-### Taxonomy Dictionary
-{code_taxo}
 
 
 ### STRICT OUTPUT FORMAT
@@ -281,6 +285,7 @@ Step 2: Determine whether the new insight is logically equivalent to one or more
 {{
     "merged_ids": [/* the insight_id values of the existing library insights you are about to merge with the new insight */],
     "reason": "<why merging reduces redundancy>",
+    "taxonomy": "<If the taxonomy of the new insights matches that of the existing library insights, keep it unchanged; otherwise, select the most appropriate taxonomy.>",
     "condition": "<State the shared trigger context grounded in the problem description or domain features. Use the pattern: 'This insight applies when … For example, when the problem statement mentioned …'. Keep it strictly non-prescriptive—no solution/advice/decision.>",
     "explanation": "<Unify the best modeling principle and typical pitfalls covered by this group. Remove overlap, keep only essentials. Use the pattern: 'When the problem involves, … . The best practice is … . A common mistake is … , which happens because … . More generally, this reflects that … .' >",
     "example": "<Integrate representative examples from the originals>"

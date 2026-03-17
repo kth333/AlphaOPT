@@ -130,7 +130,7 @@ class ProgramGenerator:
                 # Extract python code from LLM response
                 parse_fn=extract_json_array, 
                 temperature=self.temp,
-                max_retry=8,
+                max_retry=3,
                 sleep_sec=0.5,
                 verbose=verbose,
                 log_header=custom_header,
@@ -168,6 +168,7 @@ class ProgramGenerator:
         
         #* Add rewrite component 
         if abl_params.rewrite and retrieved_insights:
+            # print("Enabling Rewrite...")
             fields_to_input = ["insight_id", "condition", "explanation"]
             retrieved_insights = self.rewrite_insights(iter, task, retrieved_insights, verbose, save_data, output_path)
         else:
@@ -175,6 +176,7 @@ class ProgramGenerator:
 
         #* Add insight example
         if abl_params.include_example:
+            # print("Enabling Insight Example...")
             fields_to_input.append("example")
 
         retrieved_insights = [{k: v for k, v in ins.items() if k in fields_to_input} for ins in retrieved_insights]
@@ -198,7 +200,7 @@ class ProgramGenerator:
                 # Extract python code from LLM response
                 parse_fn=self.extract_text, 
                 temperature=self.temp,
-                max_retry=8,
+                max_retry=3,
                 sleep_sec=0.5,
                 verbose=verbose,
                 log_header=custom_header,
@@ -254,7 +256,7 @@ class ProgramGenerator:
                 # Extract python code from LLM response
                 parse_fn=partial(self.extract_code, formatted_output=formatted_output), 
                 temperature=self.temp,
-                max_retry=8,
+                max_retry=3,
                 sleep_sec=0.5,
                 verbose=verbose,
                 log_header=custom_header,
@@ -333,13 +335,13 @@ class ProgramGenerator:
             
             try:
                 corrected_program = call_llm_and_parse_with_retry(
-                    model       = self.model, 
+                    model       = self.model, #TODO self.model?  "gemini-2.5-pro"
                     service     = self.service,
                     prompt      = prompt, 
                     # Extract code script from LLM response
                     parse_fn    = partial(self.extract_code, formatted_output=formatted_output), 
                     temperature = 0.7,
-                    max_retry   = 3,                  
+                    max_retry   = 5,                  
                     sleep_sec   = 2,
                     verbose     = verbose, #verbose,
                     log_header  = log_header,

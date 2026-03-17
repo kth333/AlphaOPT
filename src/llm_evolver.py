@@ -1,4 +1,5 @@
 from __future__ import annotations # Enable postponed (lazy) evaluation of type hints
+import os
 import re
 import glob
 import json
@@ -31,16 +32,35 @@ class LibraryEvolution:
         self.model = model
         self.temp = temperature
 
-    def verify_retrieval(self, ins_id, tasks, task_ids, llm_retri):
+    def verify_retrieval(
+        self,
+        ins_id,
+        tasks,
+        task_ids,
+        llm_retri,
+        *,
+        stage: str = "Formulation",
+        config_override=None,
+        formulation_lookup=None,
+    ):
         count = 0
         tasks_subset = tasks.subset_by_ids(task_ids)
         matched_task_ids = []
         for task in tasks_subset:
+            formulation = None
+            if stage == "Program" and formulation_lookup is not None:
+                try:
+                    formulation = formulation_lookup(task)
+                except Exception:
+                    # Best-effort: proceed without formulation if lookup fails.
+                    formulation = None
+
             formulation_ins = llm_retri.retrieve_applicable_insights(
                     iter=None,
                     task=task,
-                    stage="Formulation",
-                    config=config,
+                    stage=stage,
+                    formulation=formulation,
+                    config=(config_override or config),
                     verbose=False,
                     save_data=False
                 )
@@ -68,19 +88,34 @@ class LibraryEvolution:
         neg_evidence = ""
         
         try:
-            with open (f"{output_dir}/task_{task.id}/Diagnosis/ins_pos_neg_diagnosis_iter_{iter}.json", encoding="utf-8") as f:
-                pos_neg_ins_diag = json.load(f)
-                neg_evidence = next(
-                    ((d.get("evidence"))
-                    for d in pos_neg_ins_diag
-                    if d.get("insight_id") == insight.insight_id),
-                    ""
-                ) 
+            # If output_dir is empty/None, do not attempt filesystem reads.
+            # This avoids constructing absolute paths like "/task_xxx/..." that always fail.
+            if output_dir:
+                diag_path = os.path.join(
+                    str(output_dir),
+                    f"task_{task.id}",
+                    "Diagnosis",
+                    f"ins_pos_neg_diagnosis_iter_{iter}.json",
+                )
+                if os.path.isfile(diag_path):
+                    with open(diag_path, encoding="utf-8") as f:
+                        pos_neg_ins_diag = json.load(f)
+                    neg_evidence = next(
+                        (
+                            d.get("evidence")
+                            for d in pos_neg_ins_diag
+                            if d.get("insight_id") == insight.insight_id
+                        ),
+                        "",
+                    )
 
         except Exception:
-            print(f"Didn't find the files for {task.id}!")
+            # Best-effort evidence; proceed with empty diag_evidence.
+            if verbose:
+                print(f"[WARN] generate_neg_condition: missing/invalid diagnosis evidence for task {task.id}")
 
-        target_ins = {"condition": insight.condition, "explanation": insight.explanation, "example": insight.example}
+        # target_ins = {"condition": insight.condition, "explanation": insight.explanation, "example": insight.example}
+        target_ins = {"condition": insight.condition, "explanation": insight.explanation}
         prompt = PROMPT_INS_NEG.format(
             target_insight=json.dumps(target_ins),
             desc=task.desc,
@@ -98,7 +133,7 @@ class LibraryEvolution:
                 prompt=prompt,
                 parse_fn=extract_json_object,
                 temperature=self.temp,
-                max_retry=5,
+                max_retry=3,
                 sleep_sec=0.5,
                 verbose=verbose,
                 error_message=error_message 
@@ -119,21 +154,33 @@ class LibraryEvolution:
         # Retrieve insight diagnosis reason
         unr_evidence = ""
         try:
-            files = glob.glob(f"{output_dir}/task_{task.id}/Diagnosis/applicable_insights_iter_{iter}_idx*.json")
-            for fp in sorted(files):
-                # print(fp)
-                with open(fp, "r", encoding="utf-8") as f:
-                    unr_ins_diag = json.load(f)
-                    unr_ins_diag = unr_ins_diag.get("applicable_insights")
-                for diag in unr_ins_diag:
-                    if diag.get("insight_id") == insight.insight_id:
-                        unr_evidence = diag.get("reason") or diag.get("evidence")
-                        break 
+            # If output_dir is empty/None, do not attempt filesystem reads.
+            if output_dir:
+                pattern = os.path.join(
+                    str(output_dir),
+                    f"task_{task.id}",
+                    "Diagnosis",
+                    f"applicable_insights_iter_{iter}_idx*.json",
+                )
+                files = glob.glob(pattern)
+                for fp in sorted(files):
+                    with open(fp, "r", encoding="utf-8") as f:
+                        unr_ins_diag = json.load(f)
+                        unr_ins_diag = unr_ins_diag.get("applicable_insights")
+                    for diag in unr_ins_diag or []:
+                        if diag.get("insight_id") == insight.insight_id:
+                            unr_evidence = diag.get("reason") or diag.get("evidence")
+                            break
+                    if unr_evidence:
+                        break
         except Exception:
-            print(f"Didn't find the files for {task.id}!")
+            # Best-effort evidence; proceed with empty diag_evidence.
+            if verbose:
+                print(f"[WARN] generate_unr_condition: missing/invalid diagnosis evidence for task {task.id}")
 
         
-        target_ins = {"condition": insight.condition, "explanation": insight.explanation, "example": insight.example}
+        # target_ins = {"condition": insight.condition, "explanation": insight.explanation, "example": insight.example}
+        target_ins = {"condition": insight.condition, "explanation": insight.explanation}
         prompt = PROMPT_INS_UNR.format(
             target_insight=json.dumps(target_ins),
             desc=task.desc,
@@ -150,7 +197,7 @@ class LibraryEvolution:
                 prompt=prompt,
                 parse_fn=extract_json_object,
                 temperature=self.temp,
-                max_retry=5,
+                max_retry=3,
                 sleep_sec=0.5,
                 verbose=verbose,
                 error_message=error_message 
@@ -169,15 +216,16 @@ class LibraryEvolution:
     def refine_insight(self, iter, neg_condition_lst, unr_condition_lst, insight, path_k=5, verbose=False):
         # Format insights for the prompt
         # target_ins = {k: insight.get(k) for k in ("condition", "explanation", "example")}
-        target_ins = {"condition": insight.condition, "explanation": insight.explanation, "example": insight.example}
+        # target_ins = {"condition": insight.condition, "explanation": insight.explanation, "example": insight.example}
 
         # Format numbered lists for the prompt
         neg_conditions_str = "\n".join(f"{i}. {cond}" for i, cond in enumerate(neg_condition_lst, start=1)) or ""
         unr_conditions_str = "\n".join(f"{i}. {cond}" for i, cond in enumerate(unr_condition_lst, start=1)) or ""
 
-        # Build refinement prompt
+        # Build refinement prompt - only pass the condition, not the entire insight
         prompt = PROMPT_INS_REFINEMENT.format(
-            original_insight=json.dumps(target_ins),
+            # original_insight=json.dumps(target_ins),
+            original_condition=insight.condition,
             neg_conditions=neg_conditions_str,
             unr_conditions=unr_conditions_str,
             path_k=path_k
@@ -193,7 +241,7 @@ class LibraryEvolution:
                 prompt=prompt,
                 parse_fn=extract_json_array,
                 temperature=self.temp,
-                max_retry=5,
+                max_retry=3,
                 sleep_sec=0.5,
                 verbose=verbose,
                 log_header=custom_header,
