@@ -560,12 +560,13 @@ def execute_code(code_str, timeout_sec=400):
     try:
         # Using subprocess to execute the code as a separate process
         result = subprocess.run(
-            [sys.executable, "-u", "-"], 
+            [sys.executable, "-u", "-"],
             input=code_str,
-            text=True, 
-            capture_output=True, 
+            text=True,
+            capture_output=True,
             check=True,
-            timeout=timeout_sec # Set the maximum run time
+            timeout=timeout_sec, # Set the maximum run time
+            encoding="utf-8"
         )
 
         # Extract Gurobi's objVal (optimal objective value) from stdout
@@ -645,7 +646,7 @@ def self_debug(
 
         except Exception as err:
             # Update prompt context with feedback about execution error
-            current_feedback = f"Execution error:\n {err.stderr}"
+            current_feedback = f"Execution error:\n {getattr(err, 'stderr', str(err))}"
 
     # Reached maximum retry for correction without successful execution
     is_optimal = False
@@ -719,7 +720,7 @@ def self_correction(
 
         except Exception as err:
             # Update prompt context with feedback about execution error
-            current_feedback = f"Execution error:\n {err.stderr}"
+            current_feedback = f"Execution error:\n {getattr(err, 'stderr', str(err))}"
 
     # Reached maximum retry for correction without successful execution
     is_optimal = False
