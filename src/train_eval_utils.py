@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 import json
 
@@ -367,6 +368,8 @@ def self_verify_retrieval_and_success(
 
 
 def save_checkpoint(library, tasks, metrics, paths, suffix):
+    os.makedirs(paths.lib_dir, exist_ok=True)
+    os.makedirs(paths.train_output_dir, exist_ok=True)
     if library:
         # Save latest library and updated taxonomy
         library.save(f"{paths.lib_dir}/library_{suffix}.json")
@@ -376,7 +379,7 @@ def save_checkpoint(library, tasks, metrics, paths, suffix):
         tasks.save_as_json(f"{paths.train_output_dir}/train_tasks_record_{suffix}.json")
     if metrics:
         # Save iteration metrics log
-        with open(paths.metrics_log_path, "w") as f:
+        with open(paths.metrics_log_path, "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
 
 
@@ -557,7 +560,7 @@ def execute_code(code_str, timeout_sec=400):
     try:
         # Using subprocess to execute the code as a separate process
         result = subprocess.run(
-            ["python", "-u", "-"], 
+            [sys.executable, "-u", "-"], 
             input=code_str,
             text=True, 
             capture_output=True, 

@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import subprocess
 from typing import Optional, List, Tuple
@@ -88,7 +89,7 @@ class ProgramGenerator:
         try:
             # Using subprocess to execute the code as a separate process
             result = subprocess.run(
-                ["python", "-u", "-"], 
+                [sys.executable, "-u", "-"], 
                 input=code_str,
                 text=True, 
                 capture_output=True, 

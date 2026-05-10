@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import subprocess
 from typing import Optional, List, Tuple
@@ -73,7 +74,7 @@ class ProgramDiagnostic:
         try:
             # Using subprocess to execute the code as a separate process
             result = subprocess.run(
-                ["python", file_path], 
+                [sys.executable, file_path], 
                 capture_output=True, 
                 text=True, 
                 check=True,
