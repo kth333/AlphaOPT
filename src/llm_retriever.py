@@ -214,7 +214,17 @@ class LibraryRetrieval:
                 output_path: str = "learning"
                 ):
         
-        if config.ablation.taxonomy:  # Enable taxonomy
+        if getattr(config.ablation, 'embedding_retrieval', False):
+            query = task.desc
+            if stage == "Program" and formulation:
+                query = f"{task.desc}\n{formulation}"
+            top_k = getattr(config.ablation, 'embedding_top_k', 20)
+            matched_insights = self.library.retrieve_by_embedding(query, top_k=top_k)
+            if not matched_insights:
+                if verbose:
+                    print(f"\n   Task {task.id} : No candidates on [{stage}] via embedding, skip!\n")
+                return []
+        elif config.ablation.taxonomy:
             matched_insights = self.quick_match_by_taxonomy(iter=iter, task=task, stage=stage, formulation=formulation, verbose=verbose, output_path=output_path)
             if not matched_insights:
                 if verbose:
@@ -445,7 +455,7 @@ class LibraryRetrieval:
                 "matched_insights": matched_insights
                 }
                 matched_insights_path = f"{output_path}/Diagnosis/matched_insights_iter_{iter}_idx_{idx}.json"
-                with open(matched_insights_path, "w") as fout:
+                with open(matched_insights_path, "w", encoding="utf-8") as fout:
                     json.dump(task_matched_insights, fout, indent=2, ensure_ascii=False)
                 
                 # Save the applicable insights

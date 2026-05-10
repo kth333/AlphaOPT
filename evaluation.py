@@ -281,6 +281,9 @@ def evaluate_single_dataset(config: Any, dataset: str) -> dict:
         # Load trained experience library
         print("Loading Library...")
         library = ExperienceLibrary.from_json_file(dataset_config.library_path)
+        if getattr(dataset_config.ablation, 'embedding_retrieval', False):
+            print("Building embedding index for semantic retrieval...")
+            library.build_embedding_index()
     else:
         print("Do task without Library...")
         library = None

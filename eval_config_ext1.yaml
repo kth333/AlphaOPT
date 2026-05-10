@@ -1,0 +1,22 @@
+datasets: [nlp4lp, nl4opt, industryor, mamo_complex, logior, optibench]
+data_path_template:  ./data/optimization_tasks/split/test_data/${dataset}_test.json
+library_path:  ./data/experience_library/iterations/replication_deepseek_100/library_refine_iter2.json
+output_folder_template: ${dataset}_deepseek_ext1_embedding
+model: deepseek/deepseek-v4-flash
+service: openrouter
+n_runs: 3
+temperature: 0.0
+pass_at_k: 1
+
+ablation:
+  taxonomy: false             # Disabled — embedding retrieval replaces taxonomy LLM call
+  embedding_retrieval: true   # Extension 1: semantic similarity for Stage 1
+  embedding_top_k: 20         # Top-K candidates passed to LLM applicability check (Stage 2)
+  rewrite: false
+  include_example: true
+  include_program_insight: true
+  max_debug_retry: 5
+
+  sweep_one_by_one: false
+  sweep_params: [include_example]
+  include_base: true

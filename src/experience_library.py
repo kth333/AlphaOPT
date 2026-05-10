@@ -3,6 +3,7 @@ import json
 from typing import List, Dict, Any, Optional, Callable
 from copy import deepcopy
 import itertools
+import numpy as np
 
 def _coerce_taxonomy(taxo: Any) -> dict:
     """
@@ -184,7 +185,7 @@ class ExperienceLibrary:
         Save the current library to a JSON file
         """
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_json(), f, indent=2)
 
     def save_taxonomy(self, path: str):
@@ -192,9 +193,65 @@ class ExperienceLibrary:
         Save the current taxonomy to a JSON file
         """
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(self.taxonomy, f, indent=2, ensure_ascii=False)
         
+    # --- Embedding-based retrieval (Extension 1) ---
+
+    _embed_model = None
+
+    @classmethod
+    def _get_embed_model(cls):
+        if cls._embed_model is None:
+            from sentence_transformers import SentenceTransformer
+            cls._embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+        return cls._embed_model
+
+    def build_embedding_index(self):
+        if not self._library:
+            self._embeddings = None
+            return
+        model = self._get_embed_model()
+        conditions = [ins.condition or "" for ins in self._library]
+        self._embeddings = model.encode(conditions, normalize_embeddings=True)
+
+    def _confidence_score(self, ins: "Insight", semantic_score: float) -> float:
+        """Confidence-weighted ranking: combine semantic similarity with
+        historical reliability and refinement recency."""
+        if ins.correctness and len(ins.correctness) > 0:
+            total_correct = sum(ins.correctness)
+            total_occur = sum(ins.occurrence) if ins.occurrence else 0
+            reliability = total_correct / total_occur if total_occur > 0 else 0.5
+        else:
+            reliability = 0.5  # uninformative prior
+        recency = 1 + 0.1 * (ins.refine_version or 0)
+        return semantic_score * reliability * recency
+
+    def retrieve_by_embedding(self, query: str, top_k: int = 20) -> list:
+        if self._embeddings is None or len(self._library) == 0:
+            return []
+        model = self._get_embed_model()
+        q_emb = model.encode([query], normalize_embeddings=True)
+        raw_scores = (self._embeddings @ q_emb.T).flatten()
+
+        # Apply confidence-weighted ranking
+        weighted_scores = np.array([
+            self._confidence_score(self._library[i], float(raw_scores[i]))
+            for i in range(len(raw_scores))
+        ])
+
+        k = min(top_k, len(weighted_scores))
+        top_indices = np.argsort(weighted_scores)[::-1][:k]
+        results = []
+        for idx in top_indices:
+            ins = self._library[idx]
+            results.append({
+                "insight_id": ins.insight_id,
+                "taxonomy": ins.taxonomy,
+                "condition": ins.condition
+            })
+        return results
+
     def update_usage(self, insight_ids: list, success: bool):
         """
         Increment occurrence for all used insight_ids.
