@@ -1,0 +1,38 @@
+# ============================================================================
+# Held-out evaluation for the grown library (Extension 2: FDLG)
+# ============================================================================
+# Identical inference pipeline to the baseline eval. The ONLY change is
+# library_path → library_grown.json. Datasets are restricted to the held-out
+# 4 (the calibration partition mamo_complex + nl4opt is excluded by design).
+
+# Held-out 4 (calibration mamo_complex + nl4opt are EXCLUDED)
+datasets: [nlp4lp, industryor, optibench, logior]
+
+data_path_template: ./data/optimization_tasks/split/test_data/${dataset}_test.json
+
+# Grown library produced by library_growth_ext2.py
+library_path: ./data/experience_library/iterations/replication_deepseek_100_grown/library_grown.json
+
+# Per-dataset output folder for this evaluation variant
+output_folder_template: ${dataset}_deepseek_ext2_growth
+
+# Same models as baseline replication
+model: deepseek/deepseek-v4-flash
+service: openrouter
+
+n_runs: 3
+temperature: 0.0
+pass_at_k: 1
+
+ablation:
+  taxonomy: true                # baseline retrieval
+  embedding_retrieval: false    # off (Ext 2 is independent of Ext 1)
+  embedding_top_k: 20
+  rewrite: false
+  include_example: true
+  include_program_insight: true
+  max_debug_retry: 5
+
+  sweep_one_by_one: false
+  sweep_params: [include_example]
+  include_base: true

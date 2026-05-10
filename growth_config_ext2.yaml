@@ -1,0 +1,70 @@
+# ============================================================================
+# Failure-Driven Library Growth (FDLG) — Extension 2 configuration
+# ============================================================================
+# Mines failed eval tasks from a calibration partition, runs AlphaOPT's
+# library_diagnosis + library_refinement on them to grow the trained library
+# past iter=2 without changing the inference pipeline.
+
+# --- Models (same pair as training) -----------------------------------------
+base_model: deepseek/deepseek-v4-flash
+base_service: openrouter
+advanced_model: deepseek/deepseek-v4-pro
+advanced_service: openrouter
+verbose: false
+
+# --- Iteration ---------------------------------------------------------------
+# Trained library ended at iter=2 (library_refine_iter2.json).
+# We continue the same numbering: diagnosis at iter=3, refinement at iter=3.
+start_iter: 3
+
+# --- Calibration partition (failure source) ----------------------------------
+# These datasets must NOT appear in the held-out eval. They donate failures
+# only; the held-out eval uses the remaining datasets.
+calibration_datasets: [mamo_complex, nl4opt]
+calibration_runs: [run_1, run_2, run_3]
+
+# Filter for which failures to mine. Options:
+#   "formulation_with_retrieval" — only the dominant 49.3% bucket
+#   "all_failures"               — every non-optimal task-run
+failure_filter: formulation_with_retrieval
+
+# Where to find the baseline tasks_record_lib.json files
+baseline_run_dir_template: ./testing/${dataset}_deepseek_replication__base/${run}/tasks_record_lib.json
+
+# --- Source library (the trained one we're growing) --------------------------
+source_library_path:  ./data/experience_library/iterations/replication_deepseek_100/library_refine_iter2.json
+source_taxonomy_path: ./data/experience_library/iterations/replication_deepseek_100/latest_taxonomy_refine_iter2.json
+
+# --- Output paths ------------------------------------------------------------
+# All artifacts of the growth phase land here so original training outputs
+# under replication_deepseek_100/ remain untouched.
+output_folder: replication_deepseek_100_grown
+file_paths:
+  train_data_path:    ./learning/replication_deepseek_100_grown/calibration_failures.json
+  train_output_dir:   ./learning/replication_deepseek_100_grown/
+  lib_dir:            ./data/experience_library/iterations/replication_deepseek_100_grown/
+  metrics_log_path:   ./learning/replication_deepseek_100_grown/iteration_metrics.json
+
+# --- Test data location (used to load full Task objects from task_ids) -------
+test_data_path_template: ./data/optimization_tasks/split/test_data/${dataset}_test.json
+
+# --- Library-evolution parameters (mirror training) --------------------------
+params:
+  num_iterations: 1                # one growth pass on the calibration failures
+  batch_size: 12
+  tolerance: 0.1
+  max_solution_attempts: 1
+  max_verify_attempts: 3
+  variant_num: 5                   # number of refined-condition variants in refinement
+
+# --- Ablation flags (match training defaults) --------------------------------
+ablation:
+  taxonomy: true
+  rewrite: false
+  include_example: true
+  include_program_insight: true
+  max_debug_retry: 3
+
+# --- Concurrency -------------------------------------------------------------
+diagnosis_max_workers: 6
+refinement_max_workers: 4
