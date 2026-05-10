@@ -325,7 +325,7 @@ def save_log_data(data, data_path):
                 f.write(data)
 
         if ext == ".py":
-            with open(data_path, "w") as f:
+            with open(data_path, "w", encoding="utf-8") as f:
                 f.write(data)
     
 
