@@ -1,6 +1,8 @@
 import os
 import time
 import json
+from dotenv import load_dotenv
+load_dotenv()
 
 from src.dataloader import DataLoader
 from src.utils import cal_time_cost
@@ -24,14 +26,14 @@ def main():
     # Re-resolve
     OmegaConf.resolve(config)
 
-    # Initialize the LLM agents
-    # Advanced models use OpenRouter
-    llm_opt = ProgramGenerator(model=config.advanced_model, service=config.advanced_service, temperature=0)
+    #   base_model (DeepSeek-V3): program generation, formulation, retrieval
+    #   advanced_model (DeepSeek-R1): insight extraction, failure diagnosis, library evolution
+    llm_opt = ProgramGenerator(model=config.base_model, service=config.base_service, temperature=0)
     llm_diag = ProgramDiagnostic(model=config.advanced_model, service=config.advanced_service, temperature=0)
     llm_ins = InsightExtractor(model=config.advanced_model, service=config.advanced_service, temperature=0.7)
 
     temp_online = 0.7 if config.params.max_solution_attempts > 1 else 0
-    llm_opt_online = ProgramGenerator(model=config.advanced_model, service=config.advanced_service, temperature=temp_online)
+    llm_opt_online = ProgramGenerator(model=config.base_model, service=config.base_service, temperature=temp_online)
 
     # 0 (start from online learning), 1 (start from library diagnosis at iter 1)
     start_iter = config.start_iter 
@@ -110,7 +112,7 @@ def main():
         save_checkpoint(library=library, tasks=train_tasks, metrics=metrics_log, paths=config.file_paths, suffix=f"diag_iter{iter}")
 
         # #* Library Refinement
-        llm_evolve = LibraryEvolution(lib=library, model=config.base_model, service=config.base_service, temperature=0.7)
+        llm_evolve = LibraryEvolution(lib=library, model=config.advanced_model, service=config.advanced_service, temperature=0.7)
         (
             refined_library,
             avg_refinement_rate,

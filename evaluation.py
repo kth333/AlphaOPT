@@ -4,6 +4,8 @@ import time
 import yaml
 import statistics
 from typing import List, Tuple, Optional, Any
+from dotenv import load_dotenv
+load_dotenv()
 
 from tqdm.auto import tqdm
 
@@ -162,7 +164,7 @@ def evaluate(
     return n_success, n_runnable, len(tasks), pass_at_k_rate, token_usage_delta
 
 
-def load_config(config_file: str) -> dict:
+def load_config(config_file: str = "eval_config.yaml") -> dict:
     """
     Load configuration from a YAML file
     """
@@ -170,7 +172,7 @@ def load_config(config_file: str) -> dict:
     #     config = yaml.safe_load(f)  
     #* Configure
     from omegaconf import OmegaConf
-    config = OmegaConf.load("eval_config.yaml")
+    config = OmegaConf.load(config_file)
 
     #* Generate a timestamp and append it to output_folder
     # ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -480,7 +482,7 @@ def evaluate_single_dataset(config: Any, dataset: str) -> dict:
     )
 
     # Save the updated log
-    with open(results_path, "w") as f:
+    with open(results_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
     
     # Restore output folder to base (avoid surprising callers)
@@ -503,7 +505,9 @@ def evaluate_single_dataset(config: Any, dataset: str) -> dict:
 
 def main() -> None:
     # Read the configuration file
-    config = load_config("./eval_params.yaml")
+    import sys
+    config_file = sys.argv[1] if len(sys.argv) > 1 else "eval_config.yaml"
+    config = load_config(config_file)
 
     # Get datasets list - support both single string and list
     # Check for 'datasets' first, then fall back to 'dataset' for backward compatibility
